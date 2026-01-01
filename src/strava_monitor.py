@@ -1,39 +1,50 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
-import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlparse
 
 import httpx
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 
 STRAVA_API_BASE = "https://www.strava.com/api/v3"
 DEFAULT_STATE_FILE = Path(".strava-monitor-state.json")
-DEFAULT_CONFIG_FILE = Path.home() / ".config" / "strava-monitor" / "config.json"
-DEFAULT_REDIRECT_URI = "http://localhost/exchange_token"
-DEFAULT_SCOPES = "activity:read_all"
+DEFAULT_CONFIG_FILE = Path(".strava-monitor-config.json")
+
+
+@dataclass
+class UserState:
+    last_activity_id: int | None = None
+    last_activity_start: str | None = None
 
 
 @dataclass
 class MonitorState:
-    last_activity_id: int | None = None
-    last_activity_start: str | None = None
+    users: dict[int, UserState] = field(default_factory=dict)
+    last_update_id: int | None = None
+    pending_token_chats: set[int] = field(default_factory=set)
 
 
 @dataclass
 class MonitorConfig:
     client_id: str | None = None
     client_secret: str | None = None
-    access_token: str | None = None
-    refresh_token: str | None = None
-    expires_at: int | None = None
+    telegram_bot_token: str | None = None
+    users: dict[int, "UserConfig"] = field(default_factory=dict)
+
+
+@dataclass
+class UserConfig:
+    chat_id: int
+    access_token: str
 
 
 @dataclass
@@ -107,11 +118,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Number of activities to fetch per poll (default: 30).",
     )
     run_parser.add_argument(
-        "--access-token",
-        default=os.getenv("STRAVA_ACCESS_TOKEN"),
-        help="Strava access token (or set STRAVA_ACCESS_TOKEN).",
-    )
-    run_parser.add_argument(
         "--config-file",
         type=Path,
         default=DEFAULT_CONFIG_FILE,
@@ -129,16 +135,35 @@ def load_state(path: Path) -> MonitorState:
         return MonitorState()
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    users_payload = payload.get("users", {})
+    users: dict[int, UserState] = {}
+    for chat_id_str, user_payload in users_payload.items():
+        try:
+            chat_id = int(chat_id_str)
+        except (TypeError, ValueError):
+            continue
+        users[chat_id] = UserState(
+            last_activity_id=user_payload.get("last_activity_id"),
+            last_activity_start=user_payload.get("last_activity_start"),
+        )
     return MonitorState(
-        last_activity_id=payload.get("last_activity_id"),
-        last_activity_start=payload.get("last_activity_start"),
+        users=users,
+        last_update_id=payload.get("last_update_id"),
+        pending_token_chats=set(payload.get("pending_token_chats", [])),
     )
 
 
 def save_state(path: Path, state: MonitorState) -> None:
     payload = {
-        "last_activity_id": state.last_activity_id,
-        "last_activity_start": state.last_activity_start,
+        "last_update_id": state.last_update_id,
+        "pending_token_chats": sorted(state.pending_token_chats),
+        "users": {
+            str(chat_id): {
+                "last_activity_id": user_state.last_activity_id,
+                "last_activity_start": user_state.last_activity_start,
+            }
+            for chat_id, user_state in state.users.items()
+        },
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -148,12 +173,24 @@ def load_config(path: Path) -> MonitorConfig:
         return MonitorConfig()
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    users_payload = payload.get("users", {})
+    users: dict[int, UserConfig] = {}
+    for chat_id_str, user_payload in users_payload.items():
+        try:
+            chat_id = int(chat_id_str)
+        except (TypeError, ValueError):
+            continue
+        access_token = user_payload.get("access_token")
+        if access_token:
+            users[chat_id] = UserConfig(
+                chat_id=chat_id,
+                access_token=access_token,
+            )
     return MonitorConfig(
         client_id=payload.get("client_id"),
         client_secret=payload.get("client_secret"),
-        access_token=payload.get("access_token"),
-        refresh_token=payload.get("refresh_token"),
-        expires_at=payload.get("expires_at"),
+        telegram_bot_token=payload.get("telegram_bot_token"),
+        users=users,
     )
 
 
@@ -161,9 +198,14 @@ def save_config(path: Path, config: MonitorConfig) -> None:
     payload = {
         "client_id": config.client_id,
         "client_secret": config.client_secret,
-        "access_token": config.access_token,
-        "refresh_token": config.refresh_token,
-        "expires_at": config.expires_at,
+        "telegram_bot_token": config.telegram_bot_token,
+        "users": {
+            str(chat_id): {
+                "chat_id": user.chat_id,
+                "access_token": user.access_token,
+            }
+            for chat_id, user in config.users.items()
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -189,7 +231,7 @@ def parse_start_date(start_date: str | None) -> datetime | None:
 
 
 def new_activities(
-    activities: Iterable[Activity], state: MonitorState
+    activities: Iterable[Activity], state: UserState
 ) -> list[Activity]:
     if state.last_activity_id is None and state.last_activity_start is None:
         return list(activities)
@@ -216,47 +258,8 @@ def format_activity(activity: Activity) -> str:
     )
 
 
-def build_authorize_url(client_id: str, redirect_uri: str, scopes: str) -> str:
-    return (
-        "https://www.strava.com/oauth/authorize"
-        f"?client_id={client_id}"
-        "&response_type=code"
-        f"&redirect_uri={redirect_uri}"
-        "&approval_prompt=force"
-        f"&scope={scopes}"
-    )
-
-
-def exchange_code_for_token(
-    client: httpx.Client,
-    client_id: str,
-    client_secret: str,
-    code: str,
-) -> dict[str, Any]:
-    response = client.post(
-        "https://www.strava.com/oauth/token",
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "grant_type": "authorization_code",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
-
-
 def prompt_input(prompt: str) -> str:
     return input(prompt).strip()
-
-
-def extract_code(redirect_url: str) -> str | None:
-    parsed = urlparse(redirect_url)
-    query = parse_qs(parsed.query)
-    codes = query.get("code")
-    if not codes:
-        return None
-    return codes[0]
 
 
 def run_setup(config_path: Path) -> int:
@@ -266,50 +269,23 @@ def run_setup(config_path: Path) -> int:
 
     client_id = prompt_input("Enter your Strava client ID: ")
     client_secret = prompt_input("Enter your Strava client secret: ")
+    telegram_bot_token = prompt_input("Enter your Telegram bot token: ")
 
-    if not client_id or not client_secret:
-        print("Client ID and client secret are required.")
+    if not client_id or not client_secret or not telegram_bot_token:
+        print("Client ID, client secret, and Telegram bot token are required.")
         return 1
-
-    authorize_url = build_authorize_url(
-        client_id=client_id,
-        redirect_uri=DEFAULT_REDIRECT_URI,
-        scopes=DEFAULT_SCOPES,
-    )
-
-    print("\nOpen this URL in your browser and authorize the app:")
-    print(authorize_url)
-    print(
-        "\nAfter approving, you will be redirected to a URL that includes "
-        "a `code` parameter."
-    )
-    redirect_url = prompt_input("Paste the full redirect URL here: ")
-    code = extract_code(redirect_url)
-    if not code:
-        print("Could not find a code parameter in the redirect URL.")
-        return 1
-
-    with httpx.Client(timeout=30.0) as client:
-        token_payload = exchange_code_for_token(
-            client=client,
-            client_id=client_id,
-            client_secret=client_secret,
-            code=code,
-        )
 
     config = MonitorConfig(
         client_id=client_id,
         client_secret=client_secret,
-        access_token=token_payload.get("access_token"),
-        refresh_token=token_payload.get("refresh_token"),
-        expires_at=token_payload.get("expires_at"),
+        telegram_bot_token=telegram_bot_token,
     )
     save_config(config_path, config)
     print(f"\nSaved configuration to {config_path}")
     return 0
 
 
-def update_state_from_latest(state: MonitorState, activities: list[Activity]) -> None:
+def update_state_from_latest(state: UserState, activities: list[Activity]) -> None:
     if not activities:
         return
     latest = max(
@@ -323,14 +299,14 @@ def update_state_from_latest(state: MonitorState, activities: list[Activity]) ->
 
 def run_once(
     client: httpx.Client,
-    state: MonitorState,
+    state: UserState,
     per_page: int,
     log_existing: bool,
-) -> bool:
+) -> list[Activity]:
     activities = fetch_activities(client, per_page)
     if not activities:
         logging.info("No activities returned from Strava.")
-        return False
+        return []
 
     if state.last_activity_id is None and state.last_activity_start is None:
         if log_existing:
@@ -339,19 +315,160 @@ def run_once(
         else:
             logging.info("Bootstrapping state without logging existing activities.")
             update_state_from_latest(state, activities)
-            return True
+            return []
     else:
         new_items = new_activities(activities, state)
 
     if not new_items:
         logging.info("No new activities found.")
-        return False
-
-    for activity in sorted(new_items, key=lambda item: item.start_date):
-        logging.info("New activity: %s", format_activity(activity))
+        return []
 
     update_state_from_latest(state, activities)
-    return True
+    return sorted(new_items, key=lambda item: item.start_date)
+
+
+def run_async(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+async def send_telegram_message(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def fetch_telegram_updates(
+    bot: Bot,
+    offset: int | None,
+) -> list[Update]:
+    return await bot.get_updates(
+        offset=offset,
+        allowed_updates=["message", "callback_query"],
+    )
+
+
+async def answer_callback(bot: Bot, callback_query_id: str) -> None:
+    await bot.answer_callback_query(callback_query_id)
+
+
+def build_welcome_message() -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "*Welcome to Strava Monitor!*\\n\\n"
+        "I can watch your Strava activities and notify you here.\\n"
+        "To get started, send me your Strava access token."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Send Strava access token",
+                    callback_data="request_token",
+                )
+            ]
+        ]
+    )
+    return text, keyboard
+
+
+def build_token_prompt() -> str:
+    return (
+        "Please send your Strava access token.\\n"
+        "You can paste it directly or use: `/token <ACCESS_TOKEN>`."
+    )
+
+
+def handle_telegram_updates(
+    bot: Bot,
+    config: MonitorConfig,
+    state: MonitorState,
+    config_path: Path,
+) -> bool:
+    offset = state.last_update_id + 1 if state.last_update_id is not None else None
+    updates = run_async(fetch_telegram_updates(bot, offset))
+    if not updates:
+        return False
+
+    max_update_id = state.last_update_id or 0
+    config_updated = False
+
+    for update in updates:
+        if update.update_id is not None:
+            max_update_id = max(max_update_id, update.update_id)
+
+        if update.callback_query:
+            if not update.callback_query.message:
+                continue
+            chat_id = update.callback_query.message.chat_id
+            if update.callback_query.data == "request_token":
+                state.pending_token_chats.add(chat_id)
+                run_async(answer_callback(bot, update.callback_query.id))
+                run_async(
+                    send_telegram_message(
+                        bot,
+                        chat_id,
+                        build_token_prompt(),
+                    )
+                )
+            continue
+
+        message = update.message or update.edited_message
+        if not message or not message.text:
+            continue
+        chat_id = message.chat_id
+        text = message.text.strip()
+
+        if text.startswith("/start"):
+            welcome_text, keyboard = build_welcome_message()
+            run_async(send_telegram_message(bot, chat_id, welcome_text, keyboard))
+            state.pending_token_chats.add(chat_id)
+            run_async(send_telegram_message(bot, chat_id, build_token_prompt()))
+            continue
+
+        token = None
+        if text.startswith("/token"):
+            token = text.removeprefix("/token").strip()
+        elif text.startswith("/"):
+            run_async(
+                send_telegram_message(
+                    bot,
+                    chat_id,
+                    "I didn't recognize that command. Use the button or `/token <ACCESS_TOKEN>`.",
+                )
+            )
+            continue
+        elif chat_id in state.pending_token_chats:
+            token = text
+
+        if not token:
+            run_async(send_telegram_message(bot, chat_id, build_token_prompt()))
+            continue
+
+        config.users[chat_id] = UserConfig(chat_id=chat_id, access_token=token)
+        config_updated = True
+        state.pending_token_chats.discard(chat_id)
+        run_async(
+            send_telegram_message(
+                bot,
+                chat_id,
+                "Thanks! I've saved your token and will notify you about new activities.",
+            )
+        )
+
+    if config_updated:
+        save_config(config_path, config)
+
+    if max_update_id != state.last_update_id:
+        state.last_update_id = max_update_id
+        return True
+    return config_updated
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -361,12 +478,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_setup(args.config_file)
 
     config = load_config(args.config_file)
-    access_token = args.access_token or config.access_token
-
-    if not access_token:
+    if not config.telegram_bot_token:
         logging.error(
-            "Missing access token. Run `strava-monitor setup`, "
-            "set STRAVA_ACCESS_TOKEN, or pass --access-token."
+            "Missing Telegram bot token. Run `strava-monitor setup` to configure it."
         )
         return 2
 
@@ -377,17 +491,47 @@ def main(argv: list[str] | None = None) -> int:
 
     state = load_state(args.state_file)
 
-    headers = {"Authorization": f"Bearer {access_token}"}
-    with httpx.Client(headers=headers, timeout=30.0) as client:
-        while True:
-            changed = run_once(client, state, args.per_page, args.log_existing)
-            if changed:
-                save_state(args.state_file, state)
+    telegram_bot = Bot(token=config.telegram_bot_token)
+    while True:
+        state_changed = handle_telegram_updates(
+            telegram_bot,
+            config,
+            state,
+            args.config_file,
+        )
 
-            if args.once:
-                break
+        if not config.users:
+            logging.info(
+                "No users configured yet. Send a token to the Telegram bot."
+            )
+        for user in list(config.users.values()):
+            headers = {"Authorization": f"Bearer {user.access_token}"}
+            user_state = state.users.setdefault(user.chat_id, UserState())
+            with httpx.Client(headers=headers, timeout=30.0) as client:
+                new_items = run_once(
+                    client,
+                    user_state,
+                    args.per_page,
+                    args.log_existing,
+                )
+            if new_items:
+                for activity in new_items:
+                    run_async(
+                        send_telegram_message(
+                            telegram_bot,
+                            user.chat_id,
+                            f"New activity: {format_activity(activity)}",
+                        )
+                    )
+                state_changed = True
 
-            time.sleep(args.poll_interval)
+        if state_changed:
+            save_state(args.state_file, state)
+
+        if args.once:
+            break
+
+        time.sleep(args.poll_interval)
 
     return 0
 
