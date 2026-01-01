@@ -357,30 +357,77 @@ async def answer_callback(bot: Bot, callback_query_id: str) -> None:
     await bot.answer_callback_query(callback_query_id)
 
 
-def build_welcome_message() -> tuple[str, InlineKeyboardMarkup]:
+def build_authorize_url(client_id: str | None) -> str | None:
+    if not client_id:
+        return None
+    return (
+        "https://www.strava.com/oauth/authorize"
+        f"?client_id={client_id}"
+        "&response_type=token"
+        "&redirect_uri=http://localhost"
+        "&scope=activity:read_all"
+        "&approval_prompt=auto"
+    )
+
+
+def build_welcome_message(
+    client_id: str | None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    link = build_authorize_url(client_id)
+    if link:
+        text = (
+            "*Welcome to Strava Monitor!*\\n\\n"
+            "1. Open the link below to authorize Strava access.\\n"
+            "2. After approving, you'll be redirected to a URL like "
+            "`http://localhost/#access_token=...`.\\n"
+            "3. Copy the `access_token` value from that URL and send it here "
+            "using `/token <ACCESS_TOKEN>`.\\n\\n"
+            f"[Open Strava authorization]({link})"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Open Strava authorization",
+                        url=link,
+                    )
+                ]
+            ]
+        )
+        return text, keyboard
+
     text = (
         "*Welcome to Strava Monitor!*\\n\\n"
         "I can watch your Strava activities and notify you here.\\n"
-        "To get started, send me your Strava access token."
+        "Ask the admin to run `strava-monitor setup` to configure the Strava "
+        "client ID so I can provide an authorization link.\\n\\n"
+        "When you have a Strava access token, send it with `/token <ACCESS_TOKEN>`."
     )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Send Strava access token",
-                    callback_data="request_token",
-                )
-            ]
-        ]
-    )
-    return text, keyboard
+    return text, None
 
 
-def build_token_prompt() -> str:
+def build_token_prompt(client_id: str | None) -> str:
+    link = build_authorize_url(client_id)
+    if link:
+        return (
+            "To get a token, open this link and authorize access:\\n"
+            f"{link}\\n\\n"
+            "After approval you'll be redirected to a URL like "
+            "`http://localhost/#access_token=...`. "
+            "Copy the `access_token` value and send it here using "
+            "`/token <ACCESS_TOKEN>`."
+        )
     return (
         "Please send your Strava access token.\\n"
         "You can paste it directly or use: `/token <ACCESS_TOKEN>`."
     )
+
+
+async def validate_strava_token(access_token: str) -> bool:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+        response = await client.get(f"{STRAVA_API_BASE}/athlete")
+    return response.status_code == 200
 
 
 async def handle_telegram_updates(
@@ -414,10 +461,12 @@ async def handle_telegram_updates(
                 async with lock:
                     state.pending_token_chats.add(chat_id)
                 await answer_callback(bot, update.callback_query.id)
+                async with lock:
+                    client_id = config.client_id
                 await send_telegram_message(
                     bot,
                     chat_id,
-                    build_token_prompt(),
+                    build_token_prompt(client_id),
                 )
             continue
 
@@ -428,11 +477,13 @@ async def handle_telegram_updates(
         text = message.text.strip()
 
         if text.startswith("/start"):
-            welcome_text, keyboard = build_welcome_message()
+            async with lock:
+                client_id = config.client_id
+            welcome_text, keyboard = build_welcome_message(client_id)
             await send_telegram_message(bot, chat_id, welcome_text, keyboard)
             async with lock:
                 state.pending_token_chats.add(chat_id)
-            await send_telegram_message(bot, chat_id, build_token_prompt())
+            await send_telegram_message(bot, chat_id, build_token_prompt(client_id))
             continue
 
         token = None
@@ -452,7 +503,19 @@ async def handle_telegram_updates(
                 token = text
 
         if not token:
-            await send_telegram_message(bot, chat_id, build_token_prompt())
+            async with lock:
+                client_id = config.client_id
+            await send_telegram_message(bot, chat_id, build_token_prompt(client_id))
+            continue
+
+        if not await validate_strava_token(token):
+            await send_telegram_message(
+                bot,
+                chat_id,
+                "I couldn't validate that token with Strava. "
+                "Please make sure you copied the full `access_token` value and "
+                "try again.",
+            )
             continue
 
         async with lock:
