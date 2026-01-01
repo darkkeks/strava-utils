@@ -12,18 +12,20 @@ uv pip install -e .
 
 ## Configure
 
-Run the guided setup to create a config file with your Strava credentials:
+Run the guided setup to create a config file with your Strava credentials and
+Telegram bot token:
 
 ```bash
 strava-monitor setup
 ```
 
-The setup flow will prompt for your client ID/secret, open the Strava authorize
-link, and ask you to paste the redirect URL so it can exchange the code for an
-access token. Configuration is saved to
-`~/.config/strava-monitor/config.json` by default.
+The setup flow will prompt for your client ID/secret and Telegram bot token.
+Configuration is saved to `.strava-monitor-config.json` in the working
+directory by default.
 
-You can still provide an access token manually:
+After setup, open the Telegram bot and follow the guided prompts (use the
+"Send Strava access token" button or send `/token <ACCESS_TOKEN>`). The bot will
+store it in the config and use it for activity monitoring.
 
 ```bash
 export STRAVA_ACCESS_TOKEN="your-token"
