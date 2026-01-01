@@ -5,7 +5,6 @@ import asyncio
 import json
 import logging
 import sys
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,8 +210,10 @@ def save_config(path: Path, config: MonitorConfig) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def fetch_activities(client: httpx.Client, per_page: int) -> list[Activity]:
-    response = client.get(
+async def fetch_activities(
+    client: httpx.AsyncClient, per_page: int
+) -> list[Activity]:
+    response = await client.get(
         f"{STRAVA_API_BASE}/athlete/activities",
         params={"per_page": per_page, "page": 1},
     )
@@ -297,13 +298,13 @@ def update_state_from_latest(state: UserState, activities: list[Activity]) -> No
     state.last_activity_start = latest.start_date
 
 
-def run_once(
-    client: httpx.Client,
+async def run_once(
+    client: httpx.AsyncClient,
     state: UserState,
     per_page: int,
     log_existing: bool,
 ) -> list[Activity]:
-    activities = fetch_activities(client, per_page)
+    activities = await fetch_activities(client, per_page)
     if not activities:
         logging.info("No activities returned from Strava.")
         return []
@@ -327,10 +328,6 @@ def run_once(
     return sorted(new_items, key=lambda item: item.start_date)
 
 
-def run_async(coro: Any) -> Any:
-    return asyncio.run(coro)
-
-
 async def send_telegram_message(
     bot: Bot,
     chat_id: int,
@@ -352,6 +349,7 @@ async def fetch_telegram_updates(
     return await bot.get_updates(
         offset=offset,
         allowed_updates=["message", "callback_query"],
+        timeout=30,
     )
 
 
@@ -385,18 +383,23 @@ def build_token_prompt() -> str:
     )
 
 
-def handle_telegram_updates(
+async def handle_telegram_updates(
     bot: Bot,
     config: MonitorConfig,
     state: MonitorState,
     config_path: Path,
+    lock: asyncio.Lock,
 ) -> bool:
-    offset = state.last_update_id + 1 if state.last_update_id is not None else None
-    updates = run_async(fetch_telegram_updates(bot, offset))
+    async with lock:
+        offset = (
+            state.last_update_id + 1 if state.last_update_id is not None else None
+        )
+    updates = await fetch_telegram_updates(bot, offset)
     if not updates:
         return False
 
-    max_update_id = state.last_update_id or 0
+    async with lock:
+        max_update_id = state.last_update_id or 0
     config_updated = False
 
     for update in updates:
@@ -408,14 +411,13 @@ def handle_telegram_updates(
                 continue
             chat_id = update.callback_query.message.chat_id
             if update.callback_query.data == "request_token":
-                state.pending_token_chats.add(chat_id)
-                run_async(answer_callback(bot, update.callback_query.id))
-                run_async(
-                    send_telegram_message(
-                        bot,
-                        chat_id,
-                        build_token_prompt(),
-                    )
+                async with lock:
+                    state.pending_token_chats.add(chat_id)
+                await answer_callback(bot, update.callback_query.id)
+                await send_telegram_message(
+                    bot,
+                    chat_id,
+                    build_token_prompt(),
                 )
             continue
 
@@ -427,56 +429,140 @@ def handle_telegram_updates(
 
         if text.startswith("/start"):
             welcome_text, keyboard = build_welcome_message()
-            run_async(send_telegram_message(bot, chat_id, welcome_text, keyboard))
-            state.pending_token_chats.add(chat_id)
-            run_async(send_telegram_message(bot, chat_id, build_token_prompt()))
+            await send_telegram_message(bot, chat_id, welcome_text, keyboard)
+            async with lock:
+                state.pending_token_chats.add(chat_id)
+            await send_telegram_message(bot, chat_id, build_token_prompt())
             continue
 
         token = None
         if text.startswith("/token"):
             token = text.removeprefix("/token").strip()
         elif text.startswith("/"):
-            run_async(
-                send_telegram_message(
-                    bot,
-                    chat_id,
-                    "I didn't recognize that command. Use the button or `/token <ACCESS_TOKEN>`.",
-                )
-            )
-            continue
-        elif chat_id in state.pending_token_chats:
-            token = text
-
-        if not token:
-            run_async(send_telegram_message(bot, chat_id, build_token_prompt()))
-            continue
-
-        config.users[chat_id] = UserConfig(chat_id=chat_id, access_token=token)
-        config_updated = True
-        state.pending_token_chats.discard(chat_id)
-        run_async(
-            send_telegram_message(
+            await send_telegram_message(
                 bot,
                 chat_id,
-                "Thanks! I've saved your token and will notify you about new activities.",
+                "I didn't recognize that command. Use the button or `/token <ACCESS_TOKEN>`.",
             )
+            continue
+        else:
+            async with lock:
+                is_pending = chat_id in state.pending_token_chats
+            if is_pending:
+                token = text
+
+        if not token:
+            await send_telegram_message(bot, chat_id, build_token_prompt())
+            continue
+
+        async with lock:
+            config.users[chat_id] = UserConfig(chat_id=chat_id, access_token=token)
+        config_updated = True
+        async with lock:
+            state.pending_token_chats.discard(chat_id)
+        await send_telegram_message(
+            bot,
+            chat_id,
+            "Thanks! I've saved your token and will notify you about new activities.",
         )
 
     if config_updated:
-        save_config(config_path, config)
+        async with lock:
+            save_config(config_path, config)
 
-    if max_update_id != state.last_update_id:
-        state.last_update_id = max_update_id
+    async with lock:
+        last_update_id = state.last_update_id
+        if max_update_id != last_update_id:
+            state.last_update_id = max_update_id
         return True
     return config_updated
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+async def run_telegram_loop(
+    bot: Bot,
+    config: MonitorConfig,
+    state: MonitorState,
+    config_path: Path,
+    state_path: Path,
+    lock: asyncio.Lock,
+) -> None:
+    while True:
+        state_changed = await handle_telegram_updates(
+            bot,
+            config,
+            state,
+            config_path,
+            lock,
+        )
 
-    if args.command == "setup":
-        return run_setup(args.config_file)
+        if state_changed:
+            async with lock:
+                save_state(state_path, state)
 
+
+async def run_strava_loop(
+    bot: Bot,
+    config: MonitorConfig,
+    state: MonitorState,
+    args: argparse.Namespace,
+    lock: asyncio.Lock,
+) -> None:
+    while True:
+        async with lock:
+            users = list(config.users.values())
+
+        if not users:
+            logging.info(
+                "No users configured yet. Send a token to the Telegram bot."
+            )
+            await asyncio.sleep(args.poll_interval)
+            continue
+
+        state_changed = False
+        for user in users:
+            headers = {"Authorization": f"Bearer {user.access_token}"}
+            async with lock:
+                current_state = state.users.get(user.chat_id, UserState())
+                user_state = UserState(
+                    last_activity_id=current_state.last_activity_id,
+                    last_activity_start=current_state.last_activity_start,
+                )
+
+            async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+                new_items = await run_once(
+                    client,
+                    user_state,
+                    args.per_page,
+                    args.log_existing,
+                )
+            if new_items:
+                for activity in new_items:
+                    await send_telegram_message(
+                        bot,
+                        user.chat_id,
+                        f"New activity: {format_activity(activity)}",
+                    )
+                state_changed = True
+            if (
+                user_state.last_activity_id != current_state.last_activity_id
+                or user_state.last_activity_start != current_state.last_activity_start
+            ):
+                state_changed = True
+
+            async with lock:
+                state.users[user.chat_id] = user_state
+
+        if state_changed:
+            async with lock:
+                save_state(args.state_file, state)
+
+        if args.once:
+            return
+
+        await asyncio.sleep(args.poll_interval)
+
+
+async def run_monitor(args: argparse.Namespace) -> int:
     config = load_config(args.config_file)
     if not config.telegram_bot_token:
         logging.error(
@@ -490,50 +576,30 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     state = load_state(args.state_file)
-
     telegram_bot = Bot(token=config.telegram_bot_token)
-    while True:
-        state_changed = handle_telegram_updates(
+    lock = asyncio.Lock()
+
+    await asyncio.gather(
+        run_telegram_loop(
             telegram_bot,
             config,
             state,
             args.config_file,
-        )
-
-        if not config.users:
-            logging.info(
-                "No users configured yet. Send a token to the Telegram bot."
-            )
-        for user in list(config.users.values()):
-            headers = {"Authorization": f"Bearer {user.access_token}"}
-            user_state = state.users.setdefault(user.chat_id, UserState())
-            with httpx.Client(headers=headers, timeout=30.0) as client:
-                new_items = run_once(
-                    client,
-                    user_state,
-                    args.per_page,
-                    args.log_existing,
-                )
-            if new_items:
-                for activity in new_items:
-                    run_async(
-                        send_telegram_message(
-                            telegram_bot,
-                            user.chat_id,
-                            f"New activity: {format_activity(activity)}",
-                        )
-                    )
-                state_changed = True
-
-        if state_changed:
-            save_state(args.state_file, state)
-
-        if args.once:
-            break
-
-        time.sleep(args.poll_interval)
-
+            args.state_file,
+            lock,
+        ),
+        run_strava_loop(telegram_bot, config, state, args, lock),
+    )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+
+    if args.command == "setup":
+        return run_setup(args.config_file)
+
+    return asyncio.run(run_monitor(args))
 
 
 if __name__ == "__main__":
