@@ -1,16 +1,17 @@
 [project]
-name = "strava-utils"
+name = "stravahooks"
 version = "0.1.0"
 description = "Utilities for Strava automation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27.0",
+  "click>=8.1.7",
   "python-telegram-bot>=21.0",
 ]
 
 [project.scripts]
-strava-monitor = "strava_monitor:main"
+stravahooks = "stravahooks.cli:main"
 
 [tool.uv]
 package = false
