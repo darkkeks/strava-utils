@@ -65,3 +65,9 @@ Run the service (mount your config):
 ```bash
 docker run --rm -p 8080:8080 -v "$PWD/stravahooks.json:/app/stravahooks.json" stravahooks
 ```
+
+### Docker Compose
+
+```bash
+docker compose up --build
+```

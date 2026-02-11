@@ -1,0 +1,7 @@
+services:
+  stravahooks:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./stravahooks.json:/app/stravahooks.json:ro
