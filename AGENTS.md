@@ -1,26 +1,22 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/stravahooks/cli.py` contains the CLI entry points.
-- `src/stravahooks/__init__.py` defines the package.
 - `README.md` documents setup and runtime usage.
-- `pyproject.toml` defines dependencies and the `stravahooks` entry point.
+- `build.gradle.kts` and `settings.gradle.kts` define Gradle dependencies and targets.
 
 ## Build, Test, and Development Commands
-- `uv venv` and `source .venv/bin/activate` create/activate a local virtualenv.
-- `uv pip install -e .` installs the CLI in editable mode.
 - `stravahooks init` creates a config stub (default `stravahooks.json`).
 - `stravahooks run` starts the service stub.
+- `gradle run` runs the JVM CLI.
+- `gradle nativeCompile` builds a GraalVM native image.
 
 ## Coding Style & Naming Conventions
-- Use Python 3.11 features (type hints, dataclasses, pathlib).
-- Indentation: 4 spaces, PEP 8 layout, 88–100 char lines preferred.
-- Naming: `snake_case` for functions/vars, `PascalCase` for classes, constants in `UPPER_SNAKE_CASE`.
-- No formatter or linter is configured; keep style consistent with `src/stravahooks/cli.py`.
+- Naming: `camelCase` for functions/vars, `PascalCase` for classes, constants in `UPPER_SNAKE_CASE`.
+- Use Kotlin conventions for identifiers and files.
 
 ## Testing Guidelines
 - No test framework is set up yet.
-- If adding tests, keep them close to the module (e.g., `tests/test_cli.py`) and document the command in `README.md`.
+- If adding tests, keep them close to the module and document the command in `README.md`.
 
 ## Commit & Pull Request Guidelines
 - Commit messages follow imperative, concise summaries (e.g., “Add guided setup and config storage”).

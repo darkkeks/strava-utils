@@ -1,7 +1,7 @@
 # Design Overview
 
 ## Product Goal
-Provide a Strava automation service similar to Strautomator, focused on safe, repeatable edits to activity metadata through user-defined scripts.
+Provide a Strava automation service similar to Strautomator, focused on safe, repeatable edits to activity metadata through user-defined JavaScript scripts.
 
 ## Core User Flow
 1. Sign up and connect a Strava account.
@@ -18,8 +18,9 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 2. Bot explains the service and offers a “Link Strava account” button.
 3. Button opens a Strava OAuth link that includes the Telegram user ID.
 4. User grants access on Strava.
-5. Strava redirects to our domain with the Telegram user ID and access token.
-6. Bot confirms the link and prompts the user to create their first action.
+5. Strava redirects to our domain with `code` and `state` (state is a random nonce we map to the Telegram user ID).
+6. Server exchanges `code` for tokens and stores them with the Telegram user mapping.
+7. Bot confirms the link and prompts the user to create their first action.
 
 ### OAuth Scope Options
 - The OAuth flow must allow selecting scopes: public read, private read, and write access.
@@ -27,8 +28,8 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 - Bot messaging should reflect the current scope level and offer an upgrade path to write access.
 
 ## Actions and Scripting
-- Actions are pure functions: input is an activity description; output is a proposed change set.
-- Users configure actions using Starlark (via `starlark-pyo3`) for rich, safe customization.
+- Actions are side-effect free scripts: input is an activity object; output is a proposed change set derived from in-place mutations.
+- Users configure actions using JavaScript executed in GraalJS.
 - Each action can be enabled/disabled and ordered in a pipeline.
 
 ### Action Dialog and Management
@@ -38,8 +39,8 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
   - run on older activities
   - enable/disable
   - delete
- - Actions execute in the order they are created; reordering is not supported in v1.
- - Users should merge actions or use conditions in code if ordering matters.
+- Actions execute in the order they are created; reordering is not supported in v1.
+- Users should merge actions or use conditions in code if ordering matters.
 
 ### Creating Actions
 - Provide templates that demonstrate API usage:
@@ -47,11 +48,11 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
   - toggle mute status
   - choose equipment/gear
 - If a template is chosen, create the action with default name and code.
-- “Create from scratch” asks the user to send Starlark code directly.
+- “Create from scratch” asks the user to send JavaScript code directly.
 - Newly created actions start disabled by default.
 
 ### Validation
-- Every time code is submitted, validate it by parsing in the Starlark interpreter.
+- Every time code is submitted, validate it by compiling in the GraalJS engine.
 - For now, only syntax validation is required.
 - Future: optional validation by running against example or user activities.
 
@@ -59,9 +60,9 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 - `id`: unique identifier.
 - `name`: short, user-facing label.
 - `description`: optional summary shown in the action detail view.
-- `code`: Starlark source for the action.
+- `code`: JavaScript source for the action.
 - `enabled`: boolean, default `false` on creation.
-- `order`: integer for pipeline ordering.
+- `order`: integer for pipeline ordering, derived from creation order in v1.
 - `created_at` / `updated_at`: timestamps for audit/history views.
 
 ## Preview and Apply Flow for Existing Activities
@@ -69,23 +70,23 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 - User chooses scope:
   - select activities one-by-one from a list, or
   - select a time range for bulk preview.
-- Bot runs the action(s) in preview mode and shows proposed changes.
+- Bot runs the full pipeline in preview mode and shows proposed changes.
 - For lists, each activity preview includes an “Apply” button and a “Skip” button.
 - For bulk ranges, show a summary of proposed changes and require confirmation before applying.
- - Each activity preview shows:
-   - activity name (current and previous if it changes)
-   - key fields such as distance and time (type-specific fields may be added)
-   - a change list with before/after values per field
- - Bulk summary includes:
-   - count of activities with changes
-   - count of activities in range with no changes
-   - button to review changed activities one-by-one
- - After confirming the summary, present:
-   - “Apply all” to apply every change immediately
-   - “Apply step by step” to review each activity with options to:
-     - apply this activity
-     - skip this activity
-     - apply all remaining changes
+- Each activity preview shows:
+  - activity name (current and previous if it changes)
+  - key fields such as distance and time (type-specific fields may be added)
+  - a change list with before/after values per field
+- Bulk summary includes:
+  - count of activities with changes
+  - count of activities in range with no changes
+  - button to review changed activities one-by-one
+- After confirming the summary, present:
+  - “Apply all” to apply every change immediately
+  - “Apply step by step” to review each activity with options to:
+    - apply this activity
+    - skip this activity
+    - apply all remaining changes
 
 ## New Activity Processing
 - Newly uploaded activities trigger the pipeline automatically.
@@ -97,11 +98,11 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
   - polling in development for simpler setup
 
 ## Activity and Change-Set Model
-- Activity fields used for actions and previews include:
+- Activity fields used for actions and previews include (normalized units):
   - `id`, `type`, `name`, `start_time`
-  - `distance`, `moving_time`, `elapsed_time`
+- `distance_m`, `moving_time_s`, `elapsed_time_s`
   - `description`, `commute`, `trainer`, `mute`
-  - `gear_id` (or equipment identifiers)
+- `gear_id` (or equipment identifiers)
 - Change-set is a list of field-level edits with before/after values.
 - Changes are applied only to fields explicitly set by actions.
 - Strava activity updates are done via `PUT /api/v3/activities/{id}` and accept
@@ -113,56 +114,75 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 - List activities: `GET /api/v3/athlete/activities` with `before`, `after`,
   `page`, `per_page`.
 - Fetch single activity: `GET /api/v3/activities/{id}` (requires read scope).
-- Gear updates: `gear_id` can be set to `'none'` to clear gear.
+- Gear updates: `gear_id` can be set to `null` to clear gear.
 
-## Starlark Action API (v1)
-- Actions are pure functions: `def action(activity): ...` mutate the activity in place and return `None`.
-- The API uses only scalar fields (no lists or dicts) to simplify diffs and previews.
-- Missing values are `None`; actions should handle `None` safely.
-- Inject the activity as a mutable struct-like object and diff before/after.
+## JavaScript Action API (v1)
+- Actions are side-effect free scripts: `function action(activity) { ... }` mutate the activity in place and return `undefined`.
+- Missing fields in the input activity are `null` for convenience.
+- `null` assigned in the action means clear the field.
+- Writing to non-writable fields is an error and triggers a user notification.
+- Reassigning `activity` to a new object has no effect; only in-place mutations are applied.
+- Detect invalid writes by diffing the activity before/after execution and validating changed fields.
 
-### Activity Fields (read-only)
-- `id`: int
+### Activity Fields (readable)
+- Normalized units are used: distances in meters (`_m`), durations in seconds (`_s`), speeds in kilometers per hour (`_kph`), cadence in rpm (`_rpm`), heart rate in bpm (`_bpm`). Raw Strava field names are not exposed to scripts.
+- `id`: number
 - `name`: string
 - `type`: string (sport type)
 - `start_time`: string (RFC 3339 timestamp)
-- `distance_m`: float
-- `moving_time_s`: int
-- `elapsed_time_s`: int
-- `description`: string or `None`
-- `commute`: bool
-- `trainer`: bool
-- `mute`: bool
+- `distance_m`: number
+- `moving_time_s`: number
+- `elapsed_time_s`: number
+- `description`: string or `null`
+- `commute`: boolean
+- `trainer`: boolean
+- `mute`: boolean
 - `visibility`: string (`public`, `followers`, `private`)
-- `gear_id`: string or `None`
-- `gear_name`: string or `None`
-- `elevation_gain_m`: float or `None`
-- `average_speed_mps`: float or `None`
-- `max_speed_mps`: float or `None`
-- `average_hr_bpm`: float or `None`
-- `max_hr_bpm`: float or `None`
-- `average_cadence_rpm`: float or `None`
+- `gear_id`: string or `null`
+- `gear_name`: string or `null`
+- `elevation_gain_m`: number or `null`
+- `average_speed_kph`: number or `null`
+- `max_speed_kph`: number or `null`
+- `average_hr_bpm`: number or `null`
+- `max_hr_bpm`: number or `null`
+- `average_cadence_rpm`: number or `null`
 
 ### Change Set (write-only)
-- Activity fields are mutable; the change set is derived from the diff between
-  input and output activity objects.
+- The change set is derived from the diff between input and output activity objects.
 - Only scalar field changes are detected; unchanged fields are ignored.
 
-### Example Action (Starlark)
-```python
-def action(activity):
-    if activity.type != "Ride":
-        return
-    if activity.distance_m is None or activity.distance_m >= 10000:
-        return
+### Writable Fields
+- `name`
+- `description`
+- `commute`
+- `trainer`
+- `mute`
+- `gear_id`
 
-    activity.mute = True
-    activity.commute = True
+### Field Validation Rules
+- `description = ""` is allowed (empty description is a valid value).
+- `gear_id = ""` is invalid and treated as an error.
+- `gear_id = null` clears the gear.
 
-    if activity.name:
-        activity.name = f"{activity.name} (mute)"
-    else:
-        activity.name = "(mute)"
+### Example Action (JavaScript)
+```javascript
+function action(activity) {
+  if (activity.type !== "Ride") {
+    return;
+  }
+  if (activity.distance_m === null || activity.distance_m >= 10000) {
+    return;
+  }
+
+  activity.mute = true;
+  activity.commute = true;
+
+  if (activity.name) {
+    activity.name = activity.name + " (mute)";
+  } else {
+    activity.name = "(mute)";
+  }
+}
 ```
 
 ## Action Templates (Initial Catalog)
@@ -171,7 +191,7 @@ def action(activity):
   - Based on the example above.
 - Template: "Condition-based description"
   - Example behavior: if `activity.type == "Run"` and `distance_m >= 5000`,
-    append `" (long run)"` to `activity.description`.
+    append " (long run)" to `activity.description`.
 - Template: "Gear selection"
   - Example behavior: set `activity.gear_id` based on `activity.type`
     (e.g., bike vs shoes).
@@ -186,8 +206,11 @@ def action(activity):
 - Editing flows are single-threaded per user to avoid conflicting drafts.
 
 ## Error Handling and Notifications
-- Starlark parse errors are returned inline with line/column hints.
+- GraalJS compile errors are returned inline with line/column hints.
+- Runtime script errors skip the action for that activity and notify the user.
+- Write errors (attempt to change non-writable fields or invalid values) skip the action for that activity and notify the user.
 - Apply failures are reported per activity with a retry button.
+- Users can configure error reporting verbosity and toggle routine notifications.
 - If a change cannot be applied due to missing scope, prompt to upgrade.
 - API rate-limit responses trigger backoff and a user-visible delay notice.
 
@@ -195,7 +218,7 @@ def action(activity):
 - The bot always shows current scope level in account settings.
 - If write scope is missing, actions still run in preview mode.
 - Users can upgrade scope via a "Re-link Strava with write access" button.
- - If updates fail on “Only Me” activities, prompt for `activity:read_all` re-link.
+- If updates fail on “Only Me” activities, prompt for `activity:read_all` re-link.
 
 ## Authentication and Account Linking
 - Default OAuth choice is write access, with UX safeguards to reduce accidental edits.
@@ -204,11 +227,11 @@ def action(activity):
 - Account settings show link status and re-auth option if tokens expire.
 - Webhook setup should verify an active subscription and create one if missing.
 - Store the last received event timestamp and object id to recover missed events later.
- - OAuth uses Strava’s web authorization endpoint:
-   - `GET https://www.strava.com/oauth/authorize`
-   - redirect back with `code` and `state` (state echoes our Telegram user ID)
- - Exchange `code` for tokens via `POST https://www.strava.com/api/v3/oauth/token`.
- - Persist `access_token`, `refresh_token`, `expires_at`, and accepted `scope`.
+- OAuth uses Strava’s web authorization endpoint:
+  - `GET https://www.strava.com/oauth/authorize`
+  - redirect back with `code` and `state` (state echoes our Telegram user ID)
+- Exchange `code` for tokens via `POST https://www.strava.com/api/v3/oauth/token`.
+- Persist `access_token`, `refresh_token`, `expires_at`, and accepted `scope`.
 - Refresh tokens with `grant_type=refresh_token` before expiration.
 
 ## Webhooks (Strava)
@@ -262,17 +285,6 @@ def action(activity):
 ## SDK and API Usage
 - Use a Telegram bot library for all bot interactions.
 - Use raw Strava HTTP APIs (no Strava client library) to avoid abstraction limits.
-- Preferred Telegram library: `python-telegram-bot`, supporting both polling and webhooks.
-
-## Applying to Existing Activities
-- Users can run actions on historical activities either:
-  - one-by-one from a list, or
-  - in bulk over a selected time range.
-- A preview mode shows the proposed edits before applying.
-
-## Automation on New Activities
-- Newly uploaded activities are detected and processed automatically.
-- Actions run in the configured order; each produces edits that can be applied to Strava.
 
 ## Next Areas to Detail
 - Authentication and account linking.

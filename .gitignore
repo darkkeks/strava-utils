@@ -1,7 +1,14 @@
-.venv/
-__pycache__/
-*.pyc
-*.egg-info/
+# Gradle
+.gradle/
+build/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# App config/data
 stravahooks.json
-.strava-monitor-config.json
-.strava-monitor-state.json
+stravahooks.db.json
+
+# OS / misc
+.DS_Store
