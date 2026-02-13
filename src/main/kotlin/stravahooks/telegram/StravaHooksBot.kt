@@ -185,6 +185,49 @@ class StravaHooksBot(
                         "Action ${action.name} is now $status."
                     }
                     editCallbackMessage(callback, text, actionDetailMarkup(action))
+                } else if (data.startsWith("action_delete:")) {
+                    val id = data.removePrefix("action_delete:")
+                    val action = getAction(callback.from.id, id)
+                    if (action == null) {
+                        editCallbackMessage(callback, "Action not found.", actionDetailMarkup(null))
+                    } else {
+                        beginActionDelete(callback.from.id, id)
+                        val name = htmlEscape(action.name)
+                        val code = htmlEscape(action.code)
+                        val text = "Delete action \"${name}\"?\n<pre><code>$code</code></pre>"
+                        editCallbackMessage(
+                            callback,
+                            text,
+                            actionDeleteMarkup(action.id),
+                            ParseMode.HTML
+                        )
+                    }
+                } else if (data.startsWith("action_delete_confirm:")) {
+                    val id = data.removePrefix("action_delete_confirm:")
+                    val deletedName = deleteAction(callback.from.id, id)
+                    if (deletedName == null) {
+                        editCallbackMessage(callback, "Action not found.", actionDetailMarkup(null))
+                    } else {
+                        val (reply, markup) = actionsReply(callback.from.id, "/actions")
+                        editCallbackMessage(
+                            callback,
+                            "Deleted action \"$deletedName\".\n\n$reply",
+                            markup
+                        )
+                    }
+                } else if (data.startsWith("action_delete_cancel:")) {
+                    val id = data.removePrefix("action_delete_cancel:")
+                    clearPendingActionDelete(callback.from.id, id)
+                    val action = getAction(callback.from.id, id)
+                    val text = if (action == null) {
+                        "Action not found."
+                    } else {
+                        val status = if (action.enabled) "enabled" else "disabled"
+                        val name = htmlEscape(action.name)
+                        val code = htmlEscape(action.code)
+                        "Action \"${name}\" ($status)\n<pre><code>$code</code></pre>"
+                    }
+                    editCallbackMessage(callback, text, actionDetailMarkup(action), ParseMode.HTML)
                 } else if (data.startsWith("apply_confirm:")) {
                     val id = data.removePrefix("apply_confirm:")
                     val text = applyPending(callback.from.id, id)
@@ -1016,6 +1059,32 @@ function action(activity) {
         return found
     }
 
+    private fun deleteAction(telegramUserId: Long, id: String): String? {
+        var deletedName: String? = null
+        dataStore.upsertUser(telegramUserId) { user ->
+            val remaining = user.actions.filterNot { action ->
+                val match = action.id == id
+                if (match) {
+                    deletedName = action.name
+                }
+                match
+            }
+            if (remaining.size == user.actions.size) {
+                return@upsertUser user
+            }
+            val clearedEdit = user.pendingActionEdit?.takeIf { it.actionId != id }
+            val clearedDelete = user.pendingActionDelete?.takeIf { it.actionId != id }
+            val clearedApply = user.pendingApply?.takeIf { !it.actionIds.contains(id) }
+            user.copy(
+                actions = remaining,
+                pendingActionEdit = clearedEdit,
+                pendingActionDelete = clearedDelete,
+                pendingApply = clearedApply
+            )
+        }
+        return deletedName
+    }
+
     private fun actionDetailMarkup(action: ActionDefinition?): InlineKeyboardMarkup? {
         if (action == null) {
             return null
@@ -1037,6 +1106,14 @@ function action(activity) {
                     .build()
             )
         )
+        val deleteRow = InlineKeyboardRow(
+            listOf(
+                InlineKeyboardButton.builder()
+                    .text("Delete")
+                    .callbackData("action_delete:${action.id}")
+                    .build()
+            )
+        )
         val menuRow = InlineKeyboardRow(
             listOf(
                 InlineKeyboardButton.builder()
@@ -1046,7 +1123,25 @@ function action(activity) {
             )
         )
         return InlineKeyboardMarkup.builder()
-            .keyboard(listOf(row, menuRow))
+            .keyboard(listOf(row, deleteRow, menuRow))
+            .build()
+    }
+
+    private fun actionDeleteMarkup(actionId: String): InlineKeyboardMarkup {
+        val row = InlineKeyboardRow(
+            listOf(
+                InlineKeyboardButton.builder()
+                    .text("Delete")
+                    .callbackData("action_delete_confirm:$actionId")
+                    .build(),
+                InlineKeyboardButton.builder()
+                    .text("Cancel")
+                    .callbackData("action_delete_cancel:$actionId")
+                    .build()
+            )
+        )
+        return InlineKeyboardMarkup.builder()
+            .keyboard(listOf(row))
             .build()
     }
 
@@ -1054,8 +1149,29 @@ function action(activity) {
         dataStore.upsertUser(telegramUserId) { user ->
             user.copy(
                 pendingActionEdit = PendingActionEdit(actionId, Instant.now().epochSecond),
+                pendingActionDelete = null,
                 pendingActionCreate = null
             )
+        }
+    }
+
+    private fun beginActionDelete(telegramUserId: Long, actionId: String) {
+        dataStore.upsertUser(telegramUserId) { user ->
+            user.copy(
+                pendingActionDelete = PendingActionDelete(actionId, Instant.now().epochSecond),
+                pendingActionEdit = null,
+                pendingActionCreate = null
+            )
+        }
+    }
+
+    private fun clearPendingActionDelete(telegramUserId: Long, actionId: String) {
+        dataStore.upsertUser(telegramUserId) { user ->
+            if (user.pendingActionDelete?.actionId != actionId) {
+                user
+            } else {
+                user.copy(pendingActionDelete = null)
+            }
         }
     }
 
@@ -1063,6 +1179,7 @@ function action(activity) {
         dataStore.upsertUser(telegramUserId) { user ->
             user.copy(
                 pendingActionCreate = PendingActionCreate(Instant.now().epochSecond, "name"),
+                pendingActionDelete = null,
                 pendingActionEdit = null
             )
         }

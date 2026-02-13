@@ -100,6 +100,7 @@ data class StoredUser(
     val strava: StravaAccount? = null,
     val actions: List<ActionDefinition> = emptyList(),
     val pendingActionEdit: PendingActionEdit? = null,
+    val pendingActionDelete: PendingActionDelete? = null,
     val pendingActionCreate: PendingActionCreate? = null,
     val pendingApply: PendingApply? = null,
     val lastPolledAt: Long? = null
@@ -132,6 +133,11 @@ data class ActionDefinition(
 )
 
 data class PendingActionEdit(
+    val actionId: String,
+    val startedAt: Long
+)
+
+data class PendingActionDelete(
     val actionId: String,
     val startedAt: Long
 )
