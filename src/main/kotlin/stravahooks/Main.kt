@@ -1,7 +1,9 @@
 package stravahooks
 
 import stravahooks.config.ConfigLoader
+import stravahooks.oauth.OAuthStateStore
 import stravahooks.oauth.StravaOAuthServer
+import stravahooks.polling.ActivityPoller
 import stravahooks.storage.DataStore
 import stravahooks.telegram.StravaHooksBot
 import org.telegram.telegrambots.longpolling.TelegramBotsLongPollingApplication
@@ -27,9 +29,11 @@ private fun runBot(configPath: Path) {
     val config = ConfigLoader.load(configPath)
     val dataPath = config.dataPath ?: error("data_path is required to persist tokens")
     val dataStore = DataStore(Path.of(dataPath))
-    val oauthServer = StravaOAuthServer(config, dataStore)
+    val oauthStateStore = OAuthStateStore(dataStore)
+    val oauthServer = StravaOAuthServer(config, dataStore, oauthStateStore)
     oauthServer.start()
-    val bot = StravaHooksBot(config.telegramBotToken, config)
+    ActivityPoller(config, dataStore).start()
+    val bot = StravaHooksBot(config.telegramBotToken, config, dataStore, oauthStateStore)
 
     TelegramBotsLongPollingApplication().use { app ->
         app.registerBot(config.telegramBotToken, bot)

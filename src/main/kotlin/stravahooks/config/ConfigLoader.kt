@@ -48,6 +48,8 @@ object ConfigLoader {
               "webhook_verify_token": "",
               "data_path": "stravahooks.db.json",
               "polling": true,
+              "polling_interval_seconds": 300,
+              "polling_lookback_seconds": 3600,
               "telegram_webhook_path": "/telegram",
               "bind_host": "0.0.0.0",
               "bind_port": 8080

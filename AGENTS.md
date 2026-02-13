@@ -27,3 +27,14 @@
 - Local config file defaults to `stravahooks.json` in the working directory.
 - Do not commit access tokens or bot tokens. Use the setup flow or environment variables for secrets.
 - If changing config schema, update the setup flow and document the migration in `README.md`.
+
+## Current Development Notes
+- Docker dev flow uses host-built `installDist` mounted into the container; `./dev-rebuild.sh` runs Gradle on the host and recreates the container. The service listens on port 8080.
+- `docker-compose.yml` mounts config and data at `/config`, with `STRAVAHOOKS_CONFIG=/config/stravahooks.json` and `data_path=/config/stravahooks.db.json`.
+- Kotlin toolchain targets 24; Graal action execution was removed in favor of Rhino (`org.mozilla:rhino:1.7.14`).
+- Action execution runs in Rhino; if code is only a body, it is wrapped in `function action(activity){ ... }`. `console.log` output is captured and shown in previews and logs.
+- `ActionEngine` normalizes updates, diffs changes, and builds update payloads; apply logs store action names and change details.
+- Token refresh is handled before Strava API calls; OAuth state nonces are persisted with TTL in the data store.
+- The bot UI favors editing existing messages for button presses; code edit prompts are new messages so action context remains visible.
+- Activity mentions should link to Strava URLs; action references should show names (not IDs).
+- Polling runs in the background when enabled, applying only enabled actions and logging changes; manual apply can use disabled actions.

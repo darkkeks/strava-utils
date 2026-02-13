@@ -12,6 +12,8 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 ## User Interface (Telegram Bot)
 - The Telegram bot is the primary UI for all workflows: signup, account linking, action setup, previews, and pipeline management.
 - UX is button-first using inline keyboards; free-form text input is only used when necessary.
+- Button presses should edit the current message, not send new ones, except for code-edit prompts which should be new messages so the action context stays visible.
+- Activity mentions should link to Strava; action mentions should show names (not IDs).
 
 ### Onboarding and Account Linking
 1. User sends `/start`, `/help`, or any command before linking their account.
@@ -29,30 +31,35 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 
 ## Actions and Scripting
 - Actions are side-effect free scripts: input is an activity object; output is a proposed change set derived from in-place mutations.
-- Users configure actions using JavaScript executed in GraalJS.
+- Users configure actions using JavaScript executed in Rhino.
+- If the user supplies only a function body, wrap it into `function action(activity){ ... }` before execution.
+- `console.log` output should be captured and displayed in previews and stored in logs.
 - Each action can be enabled/disabled and ordered in a pipeline.
 
 ### Action Dialog and Management
 - The action dialog lists configured actions and offers a “Create action” button.
 - Selecting an action shows its name, description, code, and options, with buttons to:
+  - show the action name in quotes and render code as a JavaScript code block
   - edit details or code
-  - run on older activities
+  - run on older activities / check on activity
   - enable/disable
   - delete
 - Actions execute in the order they are created; reordering is not supported in v1.
 - Users should merge actions or use conditions in code if ordering matters.
 
 ### Creating Actions
-- Provide templates that demonstrate API usage:
+- Flow: user taps "Create action", enters a name, sees a default example and can keep it or paste code.
+- After code (or keeping default), immediately prompt to select an activity and show a preview.
+- Newly created actions start disabled by default.
+-
+- Future: provide templates that demonstrate API usage:
   - edit description based on conditions and activity fields
   - toggle mute status
   - choose equipment/gear
-- If a template is chosen, create the action with default name and code.
-- “Create from scratch” asks the user to send JavaScript code directly.
-- Newly created actions start disabled by default.
+- Future: if a template is chosen, create the action with default name and code.
 
 ### Validation
-- Every time code is submitted, validate it by compiling in the GraalJS engine.
+- Every time code is submitted, validate it by compiling in Rhino.
 - For now, only syntax validation is required.
 - Future: optional validation by running against example or user activities.
 
@@ -66,27 +73,13 @@ Provide a Strava automation service similar to Strautomator, focused on safe, re
 - `created_at` / `updated_at`: timestamps for audit/history views.
 
 ## Preview and Apply Flow for Existing Activities
-- Entry point from the action detail view: “Run on older activities”.
-- User chooses scope:
-  - select activities one-by-one from a list, or
-  - select a time range for bulk preview.
-- Bot runs the full pipeline in preview mode and shows proposed changes.
-- For lists, each activity preview includes an “Apply” button and a “Skip” button.
-- For bulk ranges, show a summary of proposed changes and require confirmation before applying.
-- Each activity preview shows:
-  - activity name (current and previous if it changes)
-  - key fields such as distance and time (type-specific fields may be added)
-  - a change list with before/after values per field
-- Bulk summary includes:
-  - count of activities with changes
-  - count of activities in range with no changes
-  - button to review changed activities one-by-one
-- After confirming the summary, present:
-  - “Apply all” to apply every change immediately
-  - “Apply step by step” to review each activity with options to:
-    - apply this activity
-    - skip this activity
-    - apply all remaining changes
+- User selects a recent activity, then selects exactly one action (no multi-select).
+- Bot runs preview and shows proposed changes plus `console.log` output.
+- Preview provides "Apply" and "Back" buttons.
+- Manual apply can run disabled actions; automatic polling uses only enabled actions.
+-
+- Future: allow selecting multiple activities or a time range for bulk preview/apply.
+- Future: bulk preview shows a summary (changed vs unchanged counts) and requires confirmation before applying.
 
 ## New Activity Processing
 - Newly uploaded activities trigger the pipeline automatically.
@@ -197,8 +190,8 @@ function action(activity) {
     (e.g., bike vs shoes).
 
 ## Bot Navigation and State
-- Primary entry points: `/start`, `/help`, and main menu button.
-- Main menu sections: Actions, Pipelines, Activity Preview, Settings.
+- Primary entry points: `/start`, `/help`, `/menu`.
+- Main menu sections: Actions, Apply, Status, Logs, Link.
 - Each view uses inline keyboard navigation with:
   - Back to previous menu
   - Cancel to exit a flow
@@ -206,7 +199,7 @@ function action(activity) {
 - Editing flows are single-threaded per user to avoid conflicting drafts.
 
 ## Error Handling and Notifications
-- GraalJS compile errors are returned inline with line/column hints.
+- Rhino compile errors are returned inline with line/column hints.
 - Runtime script errors skip the action for that activity and notify the user.
 - Write errors (attempt to change non-writable fields or invalid values) skip the action for that activity and notify the user.
 - Apply failures are reported per activity with a retry button.
@@ -223,8 +216,9 @@ function action(activity) {
 ## Authentication and Account Linking
 - Default OAuth choice is write access, with UX safeguards to reduce accidental edits.
 - OAuth link includes a Telegram user ID parameter for mapping the callback.
+- Persist state nonces with TTL so OAuth callbacks survive restarts.
 - Store refresh tokens and support token refresh to keep automations running.
-- Account settings show link status and re-auth option if tokens expire.
+- Account settings show link status, athlete name, and re-auth/upgrade options if tokens expire or scopes are missing.
 - Webhook setup should verify an active subscription and create one if missing.
 - Store the last received event timestamp and object id to recover missed events later.
 - OAuth uses Strava’s web authorization endpoint:
@@ -252,7 +246,7 @@ function action(activity) {
 - Use a repository-style abstraction to isolate data access and allow swapping
   to another storage backend later.
 - Activity previews and change sets are cached for quick per-activity review.
-- Keep a minimal audit log of applied changes (activity id, fields, timestamp).
+- Keep a minimal audit log of applied changes (activity id, action names, fields, timestamp, logs).
 - State is shared through the storage layer; for early versions, any queueing
   can be modeled in the same JSON storage for simplicity.
 - Keep the JSON schema minimal and flexible; optimize only if needed later.

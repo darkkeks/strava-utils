@@ -19,6 +19,7 @@ dependencies {
     implementation("io.ktor:ktor-client-cio:3.3.0")
     implementation("io.ktor:ktor-client-content-negotiation:3.3.0")
     implementation("io.ktor:ktor-serialization-jackson:3.3.0")
+    implementation("org.mozilla:rhino:1.7.14")
     implementation("org.telegram:telegrambots-longpolling:9.2.1")
     implementation("org.telegram:telegrambots-client:9.2.1")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.21.0")
@@ -32,7 +33,7 @@ tasks.test {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(24)
 }
 
 application {

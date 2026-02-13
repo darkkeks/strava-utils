@@ -1,7 +1,19 @@
 services:
   stravahooks:
-    build: .
+    image: eclipse-temurin:24-jre
+    command: ["/app/bin/strava-utils", "run"]
     ports:
       - "8080:8080"
     volumes:
-      - ./stravahooks.json:/app/stravahooks.json:ro
+      - ./build/install/strava-utils:/app
+      - ./stravahooks.json:/config/stravahooks.json:ro
+      - ./stravahooks.db.json:/config/stravahooks.db.json
+    environment:
+      - VIRTUAL_HOST=strava.darkkeks.me
+      - STRAVAHOOKS_CONFIG=/config/stravahooks.json
+    networks:
+      - server-stuff_default
+
+networks:
+  server-stuff_default:
+    external: true

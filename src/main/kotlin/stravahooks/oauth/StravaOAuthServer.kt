@@ -18,10 +18,15 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.forms.submitForm
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.Parameters
+import io.ktor.http.isSuccess
 import io.ktor.serialization.jackson.jackson
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import org.slf4j.LoggerFactory
 import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage
@@ -29,8 +34,10 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 
 class StravaOAuthServer(
     private val config: StravaHooksConfig,
-    private val dataStore: DataStore
+    private val dataStore: DataStore,
+    private val oauthStateStore: OAuthStateStore
 ) {
+    private val defaultScopes = "read,activity:read_all,activity:write"
     private val client = HttpClient(CIO) {
         install(ContentNegotiation) {
             jackson()
@@ -59,6 +66,7 @@ class StravaOAuthServer(
                 get("/strava/oauth/callback") {
                     val code = call.request.queryOrNull("code")
                     val state = call.request.queryOrNull("state")
+                    val scopeParam = call.request.queryOrNull("scope")
 
                     if (code.isNullOrBlank() || state.isNullOrBlank()) {
                         logger.warn("OAuth callback missing code or state")
@@ -66,7 +74,7 @@ class StravaOAuthServer(
                         return@get
                     }
 
-                    val telegramUserId = OAuthStateStore.consume(state)
+                    val telegramUserId = oauthStateStore.consume(state)
                     if (telegramUserId == null) {
                         logger.warn("OAuth callback state invalid or expired")
                         call.respondText("Invalid or expired state. Please link again from Telegram.")
@@ -74,8 +82,17 @@ class StravaOAuthServer(
                     }
 
                     val token = exchangeCode(code)
-                    persistTokens(telegramUserId, token)
-                    notifyLinked(telegramUserId, token.scope)
+                    val mergedToken = if (token.scope.isNullOrBlank() && !scopeParam.isNullOrBlank()) {
+                        token.copy(scope = scopeParam)
+                    } else {
+                        token
+                    }
+                    if (!mergedToken.isComplete()) {
+                        call.respondText("Failed to link Strava account. Please try again.")
+                        return@get
+                    }
+                    persistTokens(telegramUserId, mergedToken)
+                    notifyLinked(telegramUserId, mergedToken.scope ?: defaultScopes)
                     call.respondText("Strava account linked. You can return to Telegram.")
                 }
             }
@@ -88,7 +105,7 @@ class StravaOAuthServer(
         require(!clientId.isNullOrBlank()) { "strava_client_id is required" }
         require(!clientSecret.isNullOrBlank()) { "strava_client_secret is required" }
 
-        return client.submitForm(
+        val response: HttpResponse = client.submitForm(
             url = "https://www.strava.com/api/v3/oauth/token",
             formParameters = Parameters.build {
                 append("client_id", clientId)
@@ -96,7 +113,25 @@ class StravaOAuthServer(
                 append("code", code)
                 append("grant_type", "authorization_code")
             }
-        ).body()
+        )
+        val raw = response.bodyAsText().trim()
+        if (!response.status.isSuccess()) {
+            val snippet = redactTokenBody(raw)
+            logger.warn("Strava token exchange failed: status=${response.status}, body=$snippet")
+            return TokenResponse()
+        }
+        return try {
+            val token: TokenResponse = jacksonObjectMapper().readValue(raw)
+            if (!token.isComplete()) {
+                logger.warn(
+                    "Strava token exchange returned incomplete payload: status=${response.status}, body=${redactTokenBody(raw)}"
+                )
+            }
+            token
+        } catch (e: Exception) {
+            logger.warn("Strava token exchange response parse failed: ${e.message}")
+            TokenResponse()
+        }
     }
 
     private fun notifyLinked(telegramUserId: Long, scope: String?) {
@@ -120,15 +155,15 @@ class StravaOAuthServer(
     }
 
     private fun persistTokens(telegramUserId: Long, token: TokenResponse) {
-        val accessToken = token.accessToken
-        val refreshToken = token.refreshToken
-        val expiresAt = token.expiresAt
-        val scope = token.scope
-        if (accessToken.isNullOrBlank() || refreshToken.isNullOrBlank() || expiresAt == null || scope.isNullOrBlank()) {
+        if (!token.isComplete()) {
             logger.error("Token response missing required fields; cannot persist")
             return
         }
 
+        val accessToken = token.accessToken.orEmpty()
+        val refreshToken = token.refreshToken.orEmpty()
+        val expiresAt = token.expiresAt ?: 0
+        val scope = token.scope ?: defaultScopes
         dataStore.upsertUser(telegramUserId) { user ->
             user.copy(
                 strava = StravaAccount(
@@ -136,7 +171,8 @@ class StravaOAuthServer(
                     refreshToken = refreshToken,
                     expiresAt = expiresAt,
                     scope = scope,
-                    athleteId = token.athlete?.id
+                    athleteId = token.athlete?.id,
+                    athleteName = token.athlete?.fullName()
                 )
             )
         }
@@ -168,5 +204,32 @@ data class TokenResponse(
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TokenAthlete(
     @field:JsonProperty("id")
-    val id: Long? = null
-)
+    val id: Long? = null,
+    @field:JsonProperty("firstname")
+    val firstName: String? = null,
+    @field:JsonProperty("lastname")
+    val lastName: String? = null
+) {
+    fun fullName(): String? {
+        val first = firstName?.trim().orEmpty()
+        val last = lastName?.trim().orEmpty()
+        val full = listOf(first, last).filter { it.isNotBlank() }.joinToString(" ")
+        return full.ifBlank { null }
+    }
+}
+
+private fun TokenResponse.isComplete(): Boolean {
+    return !accessToken.isNullOrBlank() &&
+        !refreshToken.isNullOrBlank() &&
+        expiresAt != null
+}
+
+private fun redactTokenBody(body: String): String {
+    if (body.isBlank()) {
+        return body
+    }
+    val redacted = body
+        .replace(Regex("\"access_token\"\\s*:\\s*\"[^\"]*\""), "\"access_token\":\"<redacted>\"")
+        .replace(Regex("\"refresh_token\"\\s*:\\s*\"[^\"]*\""), "\"refresh_token\":\"<redacted>\"")
+    return if (redacted.length > 500) redacted.take(500) + "…" else redacted
+}

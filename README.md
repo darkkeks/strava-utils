@@ -71,3 +71,11 @@ docker run --rm -p 8080:8080 -v "$PWD/stravahooks.json:/app/stravahooks.json" st
 ```bash
 docker compose up --build
 ```
+
+## Dev workflow
+
+Fast host build + container restart:
+
+```bash
+./dev-rebuild.sh
+```
