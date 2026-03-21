@@ -1,11 +1,14 @@
 package stravahooks.storage
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import kotlin.io.path.exists
 import kotlin.io.path.createDirectories
 import kotlin.io.path.writeText
@@ -31,6 +34,9 @@ class DataStore(private val path: Path) {
             parent.createDirectories()
         }
         path.writeText(mapper.writeValueAsString(state))
+        runCatching {
+            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"))
+        }
     }
 
     @Synchronized
@@ -108,7 +114,7 @@ data class StoredUser(
 
 data class OAuthStateEntry(
     val nonce: String,
-    val telegramUserId: Long?,
+    val telegramUserId: Long,
     val issuedAt: Long
 )
 
@@ -134,7 +140,8 @@ data class ActionDefinition(
 
 data class PendingActionEdit(
     val actionId: String,
-    val startedAt: Long
+    val startedAt: Long,
+    val field: String = "code"
 )
 
 data class PendingActionDelete(
@@ -142,9 +149,14 @@ data class PendingActionDelete(
     val startedAt: Long
 )
 
+enum class ActionCreateStage {
+    @JsonProperty("name") NAME,
+    @JsonProperty("code") CODE
+}
+
 data class PendingActionCreate(
     val startedAt: Long,
-    val stage: String,
+    val stage: ActionCreateStage,
     val name: String? = null
 )
 
@@ -153,6 +165,7 @@ data class PendingApply(
     val actionIds: List<String>,
     val update: ActivityUpdate,
     val summary: String,
+    val changes: Map<String, ChangePair> = emptyMap(),
     val createdAt: Long
 )
 
@@ -166,17 +179,31 @@ data class ActivityUpdate(
     val gearId: String? = null
 )
 
+enum class ApplyMode {
+    @JsonProperty("poll") POLL,
+    @JsonProperty("preview") PREVIEW,
+    @JsonProperty("apply") APPLY
+}
+
+enum class ApplyResult {
+    @JsonProperty("applied") APPLIED,
+    @JsonProperty("failed") FAILED,
+    @JsonProperty("error") ERROR,
+    @JsonProperty("no_changes") NO_CHANGES,
+    @JsonProperty("preview_ready") PREVIEW_READY
+}
+
 data class ApplyLogEntry(
     val timestamp: Long,
     val telegramUserId: Long,
     val activityId: Long,
     val actionIds: List<String>,
     val actionNames: List<String>,
-    val mode: String,
+    val mode: ApplyMode,
     val summary: String,
     val changes: Map<String, ChangePair>,
     val logs: List<String>,
-    val result: String,
+    val result: ApplyResult,
     val error: String? = null
 )
 

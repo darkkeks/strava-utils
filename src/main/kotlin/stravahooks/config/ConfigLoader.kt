@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import java.nio.file.Path
-import java.nio.file.Paths
 import kotlin.io.path.exists
 
 object ConfigLoader {
@@ -16,9 +15,9 @@ object ConfigLoader {
     fun defaultPath(): Path {
         val override = System.getenv("STRAVAHOOKS_CONFIG")
         return if (override.isNullOrBlank()) {
-            Paths.get("stravahooks.json")
+            Path.of("stravahooks.json")
         } else {
-            Paths.get(override)
+            Path.of(override)
         }
     }
 

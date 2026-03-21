@@ -1,0 +1,75 @@
+style:
+  WildcardImport:
+    active: true
+    excludes:
+      - "**Test.kt"
+      - "**/test/**"
+  MaxLineLength:
+    active: true
+    maxLineLength: 160
+  ReturnCount:
+    active: true
+    max: 10
+  LoopWithTooManyJumpStatements:
+    active: false
+  MagicNumber:
+    active: true
+    ignoreNumbers:
+      - "-1"
+      - "0"
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "10"
+      - "18"
+      - "20"
+      - "21"
+      - "30"
+      - "60"
+      - "100"
+      - "113"
+      - "500"
+      - "1000"
+      - "3600"
+    ignoreExtensionFunctions: true
+    ignorePropertyDeclaration: true
+    ignoreLocalVariableDeclaration: false
+    ignoreConstantDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+    ignoreEnums: true
+    ignoreRanges: false
+    ignoreHashCodeFunction: true
+
+potential-bugs:
+  ImplicitDefaultLocale:
+    active: false
+
+coroutines:
+  active: false
+
+complexity:
+  LongParameterList:
+    functionThreshold: 10
+    constructorThreshold: 10
+  LongMethod:
+    threshold: 150
+  TooManyFunctions:
+    thresholdInClasses: 50
+    thresholdInObjects: 20
+    thresholdInInterfaces: 20
+    thresholdInFiles: 50
+    thresholdInEnums: 20
+  CyclomaticComplexMethod:
+    threshold: 40
+  NestedBlockDepth:
+    threshold: 6
+  LargeClass:
+    threshold: 850
+
+exceptions:
+  TooGenericExceptionCaught:
+    active: false
+  TooGenericExceptionThrown:
+    active: false

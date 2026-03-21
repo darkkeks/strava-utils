@@ -3,6 +3,8 @@ package stravahooks.oauth
 import stravahooks.config.StravaHooksConfig
 import stravahooks.storage.DataStore
 import stravahooks.storage.StravaAccount
+import stravahooks.strava.REQUIRED_STRAVA_SCOPES
+import stravahooks.telegram.NotificationSender
 import io.ktor.server.application.ApplicationStopping
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
@@ -28,16 +30,19 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.slf4j.LoggerFactory
-import org.telegram.telegrambots.client.okhttp.OkHttpTelegramClient
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage
-import org.telegram.telegrambots.meta.exceptions.TelegramApiException
 
 class StravaOAuthServer(
     private val config: StravaHooksConfig,
     private val dataStore: DataStore,
-    private val oauthStateStore: OAuthStateStore
+    private val oauthStateStore: OAuthStateStore,
+    private val notificationSender: NotificationSender
 ) {
-    private val defaultScopes = "read,activity:read_all,activity:write"
+    private val defaultScopes = REQUIRED_STRAVA_SCOPES.joinToString(",")
+
+    companion object {
+        private const val DEFAULT_PORT = 8080
+    }
+    private val mapper = jacksonObjectMapper()
     private val client = HttpClient(CIO) {
         install(ContentNegotiation) {
             jackson()
@@ -47,7 +52,7 @@ class StravaOAuthServer(
 
     fun start() {
         val host = config.bindHost ?: "0.0.0.0"
-        val port = config.bindPort ?: 8080
+        val port = config.bindPort ?: DEFAULT_PORT
 
         embeddedServer(Netty, host = host, port = port) {
             monitor.subscribe(ApplicationStopping) {
@@ -121,7 +126,7 @@ class StravaOAuthServer(
             return TokenResponse()
         }
         return try {
-            val token: TokenResponse = jacksonObjectMapper().readValue(raw)
+            val token: TokenResponse = mapper.readValue(raw)
             if (!token.isComplete()) {
                 logger.warn(
                     "Strava token exchange returned incomplete payload: status=${response.status}, body=${redactTokenBody(raw)}"
@@ -135,23 +140,12 @@ class StravaOAuthServer(
     }
 
     private fun notifyLinked(telegramUserId: Long, scope: String?) {
-        val telegramClient = OkHttpTelegramClient(config.telegramBotToken)
         val text = if (scope.isNullOrBlank()) {
             "Strava account linked."
         } else {
             "Strava account linked. Scope: $scope"
         }
-
-        val message = SendMessage.builder()
-            .chatId(telegramUserId.toString())
-            .text(text)
-            .build()
-
-        try {
-            telegramClient.execute(message)
-        } catch (e: TelegramApiException) {
-            logger.warn("Failed to send Telegram notification: ${e.message}")
-        }
+        notificationSender.sendNotification(telegramUserId, text)
     }
 
     private fun persistTokens(telegramUserId: Long, token: TokenResponse) {
@@ -231,5 +225,6 @@ private fun redactTokenBody(body: String): String {
     val redacted = body
         .replace(Regex("\"access_token\"\\s*:\\s*\"[^\"]*\""), "\"access_token\":\"<redacted>\"")
         .replace(Regex("\"refresh_token\"\\s*:\\s*\"[^\"]*\""), "\"refresh_token\":\"<redacted>\"")
+        .replace(Regex("\"client_secret\"\\s*:\\s*\"[^\"]*\""), "\"client_secret\":\"<redacted>\"")
     return if (redacted.length > 500) redacted.take(500) + "…" else redacted
 }

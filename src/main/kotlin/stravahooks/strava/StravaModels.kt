@@ -3,6 +3,8 @@ package stravahooks.strava
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 
+val REQUIRED_STRAVA_SCOPES = listOf("read", "activity:read_all", "activity:write")
+
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class StravaActivity(
     @field:JsonProperty("id")

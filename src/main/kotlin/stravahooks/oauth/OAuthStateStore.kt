@@ -11,7 +11,7 @@ class OAuthStateStore(
 ) {
     private val random = SecureRandom()
 
-    fun issue(telegramUserId: Long?): String {
+    fun issue(telegramUserId: Long): String {
         val bytes = ByteArray(18)
         random.nextBytes(bytes)
         val nonce = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)

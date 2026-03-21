@@ -1,48 +1,62 @@
 package stravahooks.polling
 
 import stravahooks.actions.ActionEngine
+import stravahooks.actions.activityUrl
+import stravahooks.actions.buildChangeSummary
 import stravahooks.config.StravaHooksConfig
 import stravahooks.storage.DataStore
 import stravahooks.storage.ApplyLogEntry
+import stravahooks.storage.ApplyMode
+import stravahooks.storage.ApplyResult
+import stravahooks.strava.StravaApi
 import stravahooks.strava.StravaClient
 import stravahooks.strava.StravaSummaryActivity
+import stravahooks.strava.TokenRefresher
+import stravahooks.telegram.NotificationSender
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import java.time.Instant
-import kotlin.concurrent.thread
 import kotlin.math.max
 
 class ActivityPoller(
     private val config: StravaHooksConfig,
-    private val dataStore: DataStore
+    private val dataStore: DataStore,
+    private val stravaApi: StravaApi = StravaClient(),
+    private val actionEngine: ActionEngine = ActionEngine(),
+    private val notificationSender: NotificationSender? = null,
+    private val tokenRefresher: TokenRefresher = TokenRefresher(config, dataStore, stravaApi)
 ) {
     private val logger = LoggerFactory.getLogger(ActivityPoller::class.java)
-    private val actionEngine = ActionEngine()
-    private val stravaClient = StravaClient()
 
-    fun start() {
-        if (!config.polling) {
-            return
-        }
-        thread(name = "activity-poller", isDaemon = true) {
-            val intervalSeconds = config.pollingIntervalSeconds ?: 300
-            while (true) {
+    fun start(): Job {
+        if (!config.polling) return Job()
+        val intervalMs = (config.pollingIntervalSeconds ?: DEFAULT_POLL_INTERVAL_SECONDS).toLong() * MILLIS_PER_SECOND
+        return CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
                 try {
                     pollOnce()
                 } catch (e: Exception) {
                     logger.warn("Polling failed: ${e.message}")
                 }
-                Thread.sleep(intervalSeconds * 1000)
+                delay(intervalMs)
             }
         }
     }
 
-    private fun pollOnce() {
+    internal suspend fun pollOnce() {
         val state = dataStore.load()
         val now = Instant.now().epochSecond
         val lookbackSeconds = config.pollingLookbackSeconds ?: 3600
+        val maxEdits = config.maxPollEditsPerCycle ?: 10
+        var editsThisCycle = 0
 
         state.users.forEach { user ->
-            val account = refreshAccountIfNeeded(user) ?: return@forEach
+            val account = tokenRefresher.refreshAccountIfNeeded(user) ?: return@forEach
             val enabledActions = user.actions.filter { it.enabled }.sortedBy { it.order }
             if (enabledActions.isEmpty()) {
                 return@forEach
@@ -53,7 +67,7 @@ class ActivityPoller(
                 return@forEach
             }
 
-            val recent = stravaClient.fetchActivitiesSince(account.accessToken, after, 30)
+            val recent = stravaApi.fetchActivitiesSince(account.accessToken, after, 30)
             if (recent.isEmpty()) {
                 return@forEach
             }
@@ -63,12 +77,17 @@ class ActivityPoller(
                 .sortedBy { it.startEpoch }
 
             var maxSeen = after
-            ordered.forEach { meta ->
+            for (meta in ordered) {
+                if (editsThisCycle >= maxEdits) {
+                    logger.info("Reached per-cycle edit cap ($maxEdits), stopping")
+                    break
+                }
                 maxSeen = max(maxSeen, meta.startEpoch)
-                val activity = stravaClient.fetchActivity(account.accessToken, meta.id) ?: return@forEach
+                val activity = stravaApi.fetchActivity(account.accessToken, meta.id) ?: continue
                 val normalized = actionEngine.normalizeActivity(activity)
-                val before = actionEngine.snapshotWritable(normalized)
-                val run = actionEngine.runActions(enabledActions, normalized)
+                val mutableNormalized = normalized.toMutableMap()
+                val before = actionEngine.snapshotWritable(mutableNormalized)
+                val run = actionEngine.runActions(enabledActions, mutableNormalized)
                 if (run.errors.isNotEmpty()) {
                     logger.warn("Action errors for ${meta.id}: ${run.errors.joinToString("; ")}")
                     dataStore.appendApplyLog(
@@ -78,17 +97,41 @@ class ActivityPoller(
                             activityId = meta.id,
                             actionIds = enabledActions.map { it.id },
                             actionNames = enabledActions.map { it.name },
-                            mode = "poll",
+                            mode = ApplyMode.POLL,
                             summary = "Action error",
                             changes = emptyMap(),
                             logs = run.logs,
-                            result = "error",
+                            result = ApplyResult.ERROR,
                             error = run.errors.joinToString("; ")
                         )
                     )
-                    return@forEach
+                    notificationSender?.sendNotification(
+                        user.telegramUserId,
+                        "Action error on activity ${activityUrl(meta.id)}:\n${run.errors.joinToString("\n")}"
+                    )
+                    continue
                 }
-                val changes = actionEngine.diffWritable(before, normalized)
+                val validation = actionEngine.validateChanges(normalized, mutableNormalized)
+                if (!validation.isValid) {
+                    logger.warn("Validation errors for ${meta.id}: ${validation.errorMessage()}")
+                    dataStore.appendApplyLog(
+                        ApplyLogEntry(
+                            timestamp = Instant.now().epochSecond,
+                            telegramUserId = user.telegramUserId,
+                            activityId = meta.id,
+                            actionIds = enabledActions.map { it.id },
+                            actionNames = enabledActions.map { it.name },
+                            mode = ApplyMode.POLL,
+                            summary = "Validation error",
+                            changes = emptyMap(),
+                            logs = run.logs,
+                            result = ApplyResult.ERROR,
+                            error = validation.errorMessage()
+                        )
+                    )
+                    continue
+                }
+                val changes = actionEngine.diffWritable(before, mutableNormalized)
                 if (changes.isEmpty()) {
                     dataStore.appendApplyLog(
                         ApplyLogEntry(
@@ -97,22 +140,25 @@ class ActivityPoller(
                             activityId = meta.id,
                             actionIds = enabledActions.map { it.id },
                             actionNames = enabledActions.map { it.name },
-                            mode = "poll",
+                            mode = ApplyMode.POLL,
                             summary = "No changes",
                             changes = emptyMap(),
                             logs = run.logs,
-                            result = "no_changes",
+                            result = ApplyResult.NO_CHANGES,
                             error = null
                         )
                     )
-                    return@forEach
+                    continue
                 }
                 val update = actionEngine.buildUpdate(changes)
                 val body = actionEngine.buildUpdateBody(update)
-                val result = stravaClient.updateActivity(account.accessToken, meta.id, body)
+                val result = stravaApi.updateActivity(account.accessToken, meta.id, body)
                 if (!result.success) {
                     val detail = result.status?.let { " ($it)" } ?: ""
                     logger.warn("Update failed$detail for ${meta.id}: ${result.body ?: result.error}")
+                }
+                if (result.success) {
+                    editsThisCycle++
                 }
                 dataStore.appendApplyLog(
                     ApplyLogEntry(
@@ -121,14 +167,20 @@ class ActivityPoller(
                         activityId = meta.id,
                         actionIds = enabledActions.map { it.id },
                         actionNames = enabledActions.map { it.name },
-                        mode = "poll",
+                        mode = ApplyMode.POLL,
                         summary = buildChangeSummary(changes),
                         changes = actionEngine.toChangePairs(changes),
                         logs = run.logs,
-                        result = if (result.success) "applied" else "failed",
+                        result = if (result.success) ApplyResult.APPLIED else ApplyResult.FAILED,
                         error = result.error ?: result.body
                     )
                 )
+                if (result.success) {
+                    notificationSender?.sendNotification(
+                        user.telegramUserId,
+                        "Applied changes to activity ${activityUrl(meta.id)}:\n${buildChangeSummary(changes)}"
+                    )
+                }
             }
 
             if (maxSeen > after) {
@@ -136,40 +188,6 @@ class ActivityPoller(
                     existing.copy(lastPolledAt = maxSeen)
                 }
             }
-        }
-    }
-
-    private fun refreshAccountIfNeeded(user: stravahooks.storage.StoredUser): stravahooks.storage.StravaAccount? {
-        val account = user.strava ?: return null
-        val now = Instant.now().epochSecond
-        if (account.expiresAt > now + 60) {
-            return account
-        }
-        val clientId = config.stravaClientId
-        val clientSecret = config.stravaClientSecret
-        if (clientId.isNullOrBlank() || clientSecret.isNullOrBlank()) {
-            return account
-        }
-        val refreshed = stravaClient.refreshToken(clientId, clientSecret, account.refreshToken)
-        if (!refreshed.success || refreshed.accessToken.isNullOrBlank() || refreshed.refreshToken.isNullOrBlank() || refreshed.expiresAt == null) {
-            return account
-        }
-        val updated = account.copy(
-            accessToken = refreshed.accessToken,
-            refreshToken = refreshed.refreshToken,
-            expiresAt = refreshed.expiresAt
-        )
-        dataStore.upsertUser(user.telegramUserId) { existing ->
-            existing.copy(strava = updated)
-        }
-        return updated
-    }
-
-    private fun buildChangeSummary(changes: Map<String, Pair<Any?, Any?>>): String {
-        return changes.entries.joinToString("\n") { (key, value) ->
-            val before = value.first?.toString() ?: "null"
-            val after = value.second?.toString() ?: "null"
-            "$key: $before -> $after"
         }
     }
 
@@ -194,4 +212,9 @@ class ActivityPoller(
         val id: Long,
         val startEpoch: Long
     )
+
+    companion object {
+        private const val DEFAULT_POLL_INTERVAL_SECONDS = 300
+        private const val MILLIS_PER_SECOND = 1000L
+    }
 }

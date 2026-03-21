@@ -16,7 +16,6 @@ import io.ktor.http.isSuccess
 import io.ktor.serialization.jackson.jackson
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
-import kotlinx.coroutines.runBlocking
 import org.slf4j.LoggerFactory
 
 data class UpdateResult(
@@ -34,7 +33,7 @@ data class TokenRefreshResult(
     val error: String? = null
 )
 
-class StravaClient {
+class StravaClient : StravaApi {
     private val logger = LoggerFactory.getLogger(StravaClient::class.java)
     private val httpClient = HttpClient(CIO) {
         install(ContentNegotiation) {
@@ -42,121 +41,109 @@ class StravaClient {
         }
     }
 
-    fun fetchActivity(accessToken: String, activityId: Long): StravaActivity? {
-        return runBlocking {
-            try {
-                httpClient.get("https://www.strava.com/api/v3/activities/$activityId") {
-                    headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
-                }.body()
-            } catch (_: Exception) {
-                null
-            }
+    override suspend fun fetchActivity(accessToken: String, activityId: Long): StravaActivity? {
+        return try {
+            httpClient.get("https://www.strava.com/api/v3/activities/$activityId") {
+                headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
+            }.body()
+        } catch (_: Exception) {
+            null
         }
     }
 
-    fun fetchRecentActivities(accessToken: String, limit: Int): List<StravaSummaryActivity> {
-        return runBlocking {
-            try {
-                val response = httpClient.get("https://www.strava.com/api/v3/athlete/activities") {
-                    headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
-                    url {
-                        parameters.append("per_page", limit.toString())
-                    }
+    override suspend fun fetchRecentActivities(accessToken: String, limit: Int): List<StravaSummaryActivity> {
+        return try {
+            val response = httpClient.get("https://www.strava.com/api/v3/athlete/activities") {
+                headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
+                url {
+                    parameters.append("per_page", limit.toString())
                 }
-                if (!response.status.isSuccess()) {
-                    val raw = response.bodyAsText().trim()
-                    val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
-                    logger.warn("Strava list activities failed: status=${response.status}, body=$snippet")
-                    return@runBlocking emptyList()
+            }
+            if (!response.status.isSuccess()) {
+                val raw = response.bodyAsText().trim()
+                val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
+                logger.warn("Strava list activities failed: status=${response.status}, body=$snippet")
+                return emptyList()
+            }
+            val activities: List<StravaSummaryActivity> = response.body()
+            logger.info("Strava list activities: fetched ${activities.size} (per_page=$limit)")
+            activities
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    override suspend fun fetchActivitiesSince(accessToken: String, afterEpochSeconds: Long, limit: Int): List<StravaSummaryActivity> {
+        return try {
+            httpClient.get("https://www.strava.com/api/v3/athlete/activities") {
+                headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
+                url {
+                    parameters.append("after", afterEpochSeconds.toString())
+                    parameters.append("per_page", limit.toString())
                 }
-                val activities: List<StravaSummaryActivity> = response.body()
-                logger.info("Strava list activities: fetched ${activities.size} (per_page=$limit)")
-                activities
-            } catch (_: Exception) {
-                emptyList()
-            }
+            }.body()
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
-    fun fetchActivitiesSince(accessToken: String, afterEpochSeconds: Long, limit: Int): List<StravaSummaryActivity> {
-        return runBlocking {
-            try {
-                httpClient.get("https://www.strava.com/api/v3/athlete/activities") {
-                    headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
-                    url {
-                        parameters.append("after", afterEpochSeconds.toString())
-                        parameters.append("per_page", limit.toString())
-                    }
-                }.body()
-            } catch (_: Exception) {
-                emptyList()
+    override suspend fun updateActivity(accessToken: String, activityId: Long, body: Map<String, Any?>): UpdateResult {
+        return try {
+            val response = httpClient.put("https://www.strava.com/api/v3/activities/$activityId") {
+                headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
+                contentType(ContentType.Application.Json)
+                setBody(body)
             }
+            if (!response.status.isSuccess()) {
+                val raw = response.bodyAsText().trim()
+                val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
+                UpdateResult(false, status = response.status.toString(), body = snippet)
+            } else {
+                UpdateResult(true)
+            }
+        } catch (e: Exception) {
+            UpdateResult(false, error = e.message)
         }
     }
 
-    fun updateActivity(accessToken: String, activityId: Long, body: Map<String, Any?>): UpdateResult {
-        return runBlocking {
-            try {
-                val response = httpClient.put("https://www.strava.com/api/v3/activities/$activityId") {
-                    headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
-                    contentType(ContentType.Application.Json)
-                    setBody(body)
-                }
-                if (!response.status.isSuccess()) {
-                    val raw = response.bodyAsText().trim()
-                    val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
-                    UpdateResult(false, status = response.status.toString(), body = snippet)
-                } else {
-                    UpdateResult(true)
-                }
-            } catch (e: Exception) {
-                UpdateResult(false, error = e.message)
-            }
+    override suspend fun fetchAthleteName(accessToken: String): String? {
+        return try {
+            val response: AthleteResponse = httpClient.get("https://www.strava.com/api/v3/athlete") {
+                headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
+            }.body()
+            response.fullName()
+        } catch (_: Exception) {
+            null
         }
     }
 
-    fun fetchAthleteName(accessToken: String): String? {
-        return runBlocking {
-            try {
-                val response: AthleteResponse = httpClient.get("https://www.strava.com/api/v3/athlete") {
-                    headers.append(HttpHeaders.Authorization, "Bearer $accessToken")
-                }.body()
-                response.fullName()
-            } catch (_: Exception) {
-                null
-            }
-        }
-    }
-
-    fun refreshToken(clientId: String, clientSecret: String, refreshToken: String): TokenRefreshResult {
-        return runBlocking {
-            try {
-                val response = httpClient.post("https://www.strava.com/api/v3/oauth/token") {
-                    setBody(
-                        mapOf(
-                            "client_id" to clientId,
-                            "client_secret" to clientSecret,
-                            "grant_type" to "refresh_token",
-                            "refresh_token" to refreshToken
-                        )
+    override suspend fun refreshToken(clientId: String, clientSecret: String, refreshToken: String): TokenRefreshResult {
+        return try {
+            val response = httpClient.post("https://www.strava.com/api/v3/oauth/token") {
+                setBody(
+                    mapOf(
+                        "client_id" to clientId,
+                        "client_secret" to clientSecret,
+                        "grant_type" to "refresh_token",
+                        "refresh_token" to refreshToken
                     )
-                    contentType(ContentType.Application.Json)
-                }
-                if (!response.status.isSuccess()) {
-                    val raw = response.bodyAsText().trim()
-                    val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
-                    return@runBlocking TokenRefreshResult(success = false, error = snippet)
-                }
-                val token: TokenResponse = response.body()
-                TokenRefreshResult(
-                    success = true,
-                    accessToken = token.accessToken,
-                    refreshToken = token.refreshToken,
-                    expiresAt = token.expiresAt
                 )
-            } catch (e: Exception) {
-                TokenRefreshResult(success = false, error = e.message)
+                contentType(ContentType.Application.Json)
             }
+            if (!response.status.isSuccess()) {
+                val raw = response.bodyAsText().trim()
+                val snippet = if (raw.length > 500) raw.take(500) + "…" else raw
+                return TokenRefreshResult(success = false, error = snippet)
+            }
+            val token: TokenResponse = response.body()
+            TokenRefreshResult(
+                success = true,
+                accessToken = token.accessToken,
+                refreshToken = token.refreshToken,
+                expiresAt = token.expiresAt
+            )
+        } catch (e: Exception) {
+            TokenRefreshResult(success = false, error = e.message)
         }
     }
 }

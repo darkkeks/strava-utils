@@ -12,12 +12,14 @@ data class ActionRunResult(
     val logs: List<String> = emptyList()
 )
 
-class ActionRunner {
+class ActionRunner(private val maxInstructions: Int = DEFAULT_MAX_INSTRUCTIONS) {
+    private val contextFactory = InstructionLimitContextFactory(maxInstructions)
+
     fun run(code: String, activity: MutableMap<String, Any?>): ActionRunResult {
         return try {
             val source = prepareSource(code)
             val logs = mutableListOf<String>()
-            val context = ContextFactory.getGlobal().enterContext()
+            val context = contextFactory.enterContext()
             try {
                 val scope: Scriptable = context.initStandardObjects()
                 val activityObject = context.newObject(scope)
@@ -27,13 +29,13 @@ class ActionRunner {
                 val console = context.newObject(scope)
                 val logFn = object : BaseFunction() {
                     override fun call(
-                        cx: org.mozilla.javascript.Context,
+                        cx: Context,
                         scope: Scriptable,
                         thisObj: Scriptable,
                         args: Array<out Any>
                     ): Any? {
                         val line = args.joinToString(" ") { arg ->
-                            val converted = org.mozilla.javascript.Context.jsToJava(arg, Any::class.java)
+                            val converted = Context.jsToJava(arg, Any::class.java)
                             converted?.toString() ?: "null"
                         }
                         logs.add(line)
@@ -65,17 +67,54 @@ class ActionRunner {
                 Context.exit()
             }
             ActionRunResult(logs = logs)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             ActionRunResult(error = e.message ?: "unknown error")
+        }
+    }
+
+    fun validateSyntax(code: String): String? {
+        return try {
+            val source = prepareSource(code)
+            val context = contextFactory.enterContext()
+            try {
+                context.compileString(source, "action.js", 1, null)
+            } finally {
+                Context.exit()
+            }
+            null
+        } catch (e: Exception) {
+            e.message ?: "Syntax error"
         }
     }
 
     private fun prepareSource(code: String): String {
         val trimmed = code.trim()
-        return if (trimmed.contains("function action")) {
+        return if (Regex("""^\s*function\s+action\s*\(""").containsMatchIn(trimmed)) {
             trimmed
         } else {
             "function action(activity) {\n$trimmed\n}\n"
         }
+    }
+
+    companion object {
+        const val DEFAULT_MAX_INSTRUCTIONS = 100_000
+    }
+}
+
+private class InstructionLimitContextFactory(private val maxInstructions: Int) : ContextFactory() {
+    companion object {
+        private const val INSTRUCTION_OBSERVER_THRESHOLD = 10_000
+    }
+    override fun observeInstructionCount(cx: Context, instructionCount: Int) {
+        if (instructionCount > maxInstructions) {
+            throw Error("Script execution exceeded $maxInstructions instruction limit")
+        }
+    }
+
+    override fun makeContext(): Context {
+        val cx = super.makeContext()
+        cx.instructionObserverThreshold = INSTRUCTION_OBSERVER_THRESHOLD
+        cx.setClassShutter { _ -> false }
+        return cx
     }
 }

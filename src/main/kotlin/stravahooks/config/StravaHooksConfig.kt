@@ -12,5 +12,7 @@ data class StravaHooksConfig(
     val pollingLookbackSeconds: Long? = 3600,
     val telegramWebhookPath: String? = null,
     val bindHost: String? = null,
-    val bindPort: Int? = null
+    val bindPort: Int? = null,
+    val maxScriptInstructions: Int? = null,
+    val maxPollEditsPerCycle: Int? = null
 )

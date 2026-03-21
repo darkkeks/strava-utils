@@ -1,6 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.3.10"
+    alias(libs.plugins.kotlin.jvm)
     application
+    alias(libs.plugins.detekt)
 }
 
 group = "stravautils"
@@ -11,21 +12,21 @@ repositories {
 }
 
 dependencies {
-    implementation("io.ktor:ktor-server-core:3.3.0")
-    implementation("io.ktor:ktor-server-netty:3.3.0")
-    implementation("io.ktor:ktor-server-call-logging:3.3.0")
-    implementation("io.ktor:ktor-server-status-pages:3.3.0")
-    implementation("io.ktor:ktor-client-core:3.3.0")
-    implementation("io.ktor:ktor-client-cio:3.3.0")
-    implementation("io.ktor:ktor-client-content-negotiation:3.3.0")
-    implementation("io.ktor:ktor-serialization-jackson:3.3.0")
-    implementation("org.mozilla:rhino:1.7.14")
-    implementation("org.telegram:telegrambots-longpolling:9.2.1")
-    implementation("org.telegram:telegrambots-client:9.2.1")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.21.0")
-    implementation("ch.qos.logback:logback-classic:1.5.18")
+    implementation(libs.ktor.server.core)
+    implementation(libs.ktor.server.netty)
+    implementation(libs.ktor.server.call.logging)
+    implementation(libs.ktor.server.status.pages)
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.content.negotiation)
+    implementation(libs.ktor.serialization.jackson)
+    implementation(libs.rhino)
+    implementation(libs.telegrambots.longpolling)
+    implementation(libs.telegrambots.client)
+    implementation(libs.jackson.module.kotlin)
+    implementation(libs.logback.classic)
     testImplementation(kotlin("test"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.13.4")
+    testImplementation(libs.junit.jupiter)
 }
 
 tasks.test {
@@ -33,9 +34,14 @@ tasks.test {
 }
 
 kotlin {
-    jvmToolchain(24)
+    jvmToolchain(21)
 }
 
 application {
     mainClass.set("stravahooks.MainKt")
+}
+
+detekt {
+    buildUponDefaultConfig = true
+    config.setFrom(file("detekt.yml"))
 }

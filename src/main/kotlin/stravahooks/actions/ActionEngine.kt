@@ -5,10 +5,13 @@ import stravahooks.storage.ActivityUpdate
 import stravahooks.strava.StravaActivity
 
 class ActionEngine(private val runner: ActionRunner = ActionRunner()) {
+
     data class ActionRunOutput(
         val errors: List<String>,
         val logs: List<String>
     )
+
+    fun validateSyntax(code: String): String? = runner.validateSyntax(code)
 
     fun runActions(actions: List<ActionDefinition>, activity: MutableMap<String, Any?>): ActionRunOutput {
         val errors = mutableListOf<String>()
@@ -28,29 +31,27 @@ class ActionEngine(private val runner: ActionRunner = ActionRunner()) {
         return ActionRunOutput(errors = errors, logs = logs)
     }
 
-    fun normalizeActivity(activity: StravaActivity): MutableMap<String, Any?> {
-        val normalized = mutableMapOf<String, Any?>()
-        normalized["id"] = activity.id
-        normalized["type"] = activity.type
-        normalized["name"] = activity.name
-        normalized["start_time"] = activity.startDate
-        normalized["distance_m"] = activity.distance
-        normalized["moving_time_s"] = activity.movingTime
-        normalized["elapsed_time_s"] = activity.elapsedTime
-        normalized["description"] = activity.description
-        normalized["commute"] = activity.commute
-        normalized["trainer"] = activity.trainer
-        normalized["mute"] = activity.mute
-        normalized["visibility"] = activity.visibility
-        normalized["gear_id"] = activity.gearId
-        normalized["gear_name"] = activity.gear?.name
-        normalized["elevation_gain_m"] = activity.totalElevationGain
-        normalized["average_speed_kph"] = activity.averageSpeed?.times(3.6)
-        normalized["max_speed_kph"] = activity.maxSpeed?.times(3.6)
-        normalized["average_hr_bpm"] = activity.averageHeartrate
-        normalized["max_hr_bpm"] = activity.maxHeartrate
-        normalized["average_cadence_rpm"] = activity.averageCadence
-        return normalized
+    fun normalizeActivity(activity: StravaActivity): Map<String, Any?> = buildMap {
+        put("id", activity.id)
+        put("type", activity.type)
+        put("name", activity.name)
+        put("start_time", activity.startDate)
+        put("distance_m", activity.distance)
+        put("moving_time_s", activity.movingTime)
+        put("elapsed_time_s", activity.elapsedTime)
+        put("description", activity.description)
+        put("commute", activity.commute)
+        put("trainer", activity.trainer)
+        put("mute", activity.mute)
+        put("visibility", activity.visibility)
+        put("gear_id", activity.gearId)
+        put("gear_name", activity.gear?.name)
+        put("elevation_gain_m", activity.totalElevationGain)
+        put("average_speed_kph", activity.averageSpeed?.times(MS_TO_KPH))
+        put("max_speed_kph", activity.maxSpeed?.times(MS_TO_KPH))
+        put("average_hr_bpm", activity.averageHeartrate)
+        put("max_hr_bpm", activity.maxHeartrate)
+        put("average_cadence_rpm", activity.averageCadence)
     }
 
     fun snapshotWritable(activity: Map<String, Any?>): Map<String, Any?> {
@@ -120,7 +121,52 @@ class ActionEngine(private val runner: ActionRunner = ActionRunner()) {
         return body
     }
 
+    data class ValidationResult(
+        val readonlyWrites: List<String> = emptyList(),
+        val invalidValues: List<String> = emptyList()
+    ) {
+        val isValid get() = readonlyWrites.isEmpty() && invalidValues.isEmpty()
+        fun errorMessage(): String {
+            val parts = mutableListOf<String>()
+            if (readonlyWrites.isNotEmpty()) {
+                parts.add("Attempted to write read-only fields: ${readonlyWrites.joinToString(", ")}")
+            }
+            if (invalidValues.isNotEmpty()) {
+                parts.add("Invalid values: ${invalidValues.joinToString(", ")}")
+            }
+            return parts.joinToString("\n")
+        }
+    }
+
+    fun validateChanges(before: Map<String, Any?>, after: Map<String, Any?>): ValidationResult {
+        val allKeys = before.keys union after.keys
+        val readonlyWrites = mutableListOf<String>()
+        val invalidValues = mutableListOf<String>()
+
+        allKeys.forEach { key ->
+            val a = before[key]
+            val b = after[key]
+            if (!valuesEqual(a, b) && key !in WRITABLE_FIELDS) {
+                readonlyWrites.add(key)
+            }
+        }
+
+        val gearId = after["gear_id"]
+        if (gearId is String && gearId.isEmpty()) {
+            invalidValues.add("gear_id cannot be empty string (use null to clear)")
+        }
+
+        return ValidationResult(readonlyWrites, invalidValues)
+    }
+
+    private fun valuesEqual(a: Any?, b: Any?): Boolean {
+        if (a == b) return true
+        if (a is Number && b is Number) return a.toDouble() == b.toDouble()
+        return false
+    }
+
     companion object {
+        private const val MS_TO_KPH = 3.6
         val WRITABLE_FIELDS = setOf("name", "description", "commute", "trainer", "mute", "gear_id")
     }
 }
